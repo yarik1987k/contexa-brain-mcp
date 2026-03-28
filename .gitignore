@@ -1,0 +1,5 @@
+/target
+*.db
+.context-brain.db
+.fastembed_cache/
+.cursor/
