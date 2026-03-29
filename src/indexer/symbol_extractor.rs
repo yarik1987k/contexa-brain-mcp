@@ -66,6 +66,8 @@ pub fn extract_symbols(source: &str, extension: &str) -> Result<Vec<Symbol>> {
         "ts" | "tsx" => extract_ts_symbols(&root, source, &mut symbols),
         "py" | "pyi" => extract_python_symbols(&root, source, &mut symbols),
         "rs" => extract_rust_symbols(&root, source, &mut symbols),
+        "go" => extract_go_symbols(&root, source, &mut symbols),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => extract_c_symbols(&root, source, &mut symbols),
         _ => {}
     }
 
@@ -80,6 +82,9 @@ fn get_language(extension: &str) -> Result<Language> {
         "tsx" => Ok(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "py" | "pyi" => Ok(tree_sitter_python::LANGUAGE.into()),
         "rs" => Ok(tree_sitter_rust::LANGUAGE.into()),
+        "go" => Ok(tree_sitter_go::LANGUAGE.into()),
+        "c" | "h" => Ok(tree_sitter_c::LANGUAGE.into()),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Ok(tree_sitter_cpp::LANGUAGE.into()),
         _ => bail!("Unsupported language: .{}", extension),
     }
 }
@@ -368,6 +373,129 @@ fn extract_rust_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
             }
             _ => {}
         }
+    }
+}
+
+// ── Go extraction ─────────────────────────────────────────────────────
+
+fn extract_go_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, source);
+                    push_symbol(symbols, name, SymbolKind::Function, &child, source);
+                }
+            }
+            "method_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, source);
+                    push_symbol(symbols, name, SymbolKind::Method, &child, source);
+                }
+            }
+            "type_declaration" => {
+                // type Foo struct { ... } or type Bar interface { ... }
+                let mut inner_cursor = child.walk();
+                for spec in child.children(&mut inner_cursor) {
+                    if spec.kind() == "type_spec" {
+                        if let Some(name_node) = spec.child_by_field_name("name") {
+                            let name = node_text(&name_node, source);
+                            let kind = if let Some(type_node) = spec.child_by_field_name("type") {
+                                match type_node.kind() {
+                                    "struct_type" => SymbolKind::Struct,
+                                    "interface_type" => SymbolKind::Interface,
+                                    _ => SymbolKind::TypeAlias,
+                                }
+                            } else {
+                                SymbolKind::TypeAlias
+                            };
+                            push_symbol(symbols, name, kind, &spec, source);
+                        }
+                    }
+                }
+            }
+            "const_declaration" | "var_declaration" => {
+                let mut inner_cursor = child.walk();
+                for spec in child.children(&mut inner_cursor) {
+                    if spec.kind() == "const_spec" || spec.kind() == "var_spec" {
+                        if let Some(name_node) = spec.child_by_field_name("name") {
+                            let name = node_text(&name_node, source);
+                            push_symbol(symbols, name, SymbolKind::Constant, &spec, source);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── C/C++ extraction ──────────────────────────────────────────────────
+
+fn extract_c_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                // Find the declarator which contains the function name
+                if let Some(declarator) = child.child_by_field_name("declarator") {
+                    if let Some(name) = find_c_function_name(&declarator, source) {
+                        push_symbol(symbols, name, SymbolKind::Function, &child, source);
+                    }
+                }
+            }
+            "declaration" => {
+                // Struct/union/enum typedefs and forward declarations
+                if let Some(type_node) = child.child_by_field_name("type") {
+                    match type_node.kind() {
+                        "struct_specifier" | "union_specifier" => {
+                            if let Some(name_node) = type_node.child_by_field_name("name") {
+                                let name = node_text(&name_node, source);
+                                push_symbol(symbols, name, SymbolKind::Struct, &child, source);
+                            }
+                        }
+                        "enum_specifier" => {
+                            if let Some(name_node) = type_node.child_by_field_name("name") {
+                                let name = node_text(&name_node, source);
+                                push_symbol(symbols, name, SymbolKind::Enum, &child, source);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "struct_specifier" | "union_specifier" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, source);
+                    push_symbol(symbols, name, SymbolKind::Struct, &child, source);
+                }
+            }
+            "enum_specifier" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, source);
+                    push_symbol(symbols, name, SymbolKind::Enum, &child, source);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recursively find the identifier inside a C declarator node.
+fn find_c_function_name(node: &Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, source)),
+        "function_declarator" | "pointer_declarator" | "parenthesized_declarator" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(name) = find_c_function_name(&child, source) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 

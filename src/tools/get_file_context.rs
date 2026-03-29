@@ -68,7 +68,14 @@ fn read_summary(content: &str, path: &Path, char_budget: usize) -> Result<String
     }
 
     // Try tree-sitter AST extraction for supported languages
-    let has_ast = matches!(ext, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "py" | "pyi" | "rs");
+    let has_ast = matches!(
+        ext,
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+        | "py" | "pyi"
+        | "rs"
+        | "go"
+        | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx"
+    );
 
     if has_ast {
         match symbol_extractor::extract_symbols(content, ext) {
@@ -122,7 +129,14 @@ fn read_symbols(content: &str, path: &Path) -> Result<String> {
     writeln!(&mut output, "# Symbols in {} ({} lines)\n", path.display(), line_count)?;
 
     // Try tree-sitter first
-    let has_ast = matches!(ext, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "py" | "pyi" | "rs");
+    let has_ast = matches!(
+        ext,
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+        | "py" | "pyi"
+        | "rs"
+        | "go"
+        | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx"
+    );
 
     if has_ast {
         match symbol_extractor::extract_symbols(content, ext) {
@@ -162,6 +176,7 @@ fn is_import_line(line: &str, ext: &str) -> bool {
         "py" | "pyi" => trimmed.starts_with("import ") || trimmed.starts_with("from "),
         "rs" => trimmed.starts_with("use ") || trimmed.starts_with("mod "),
         "go" => trimmed.starts_with("import "),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => trimmed.starts_with("#include"),
         _ => false,
     }
 }
@@ -192,6 +207,14 @@ fn is_symbol_line(trimmed: &str, ext: &str) -> bool {
                 || trimmed.starts_with("impl ")
         }
         "go" => trimmed.starts_with("func ") || trimmed.starts_with("type "),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => {
+            // Heuristic: lines that look like function definitions or struct/class declarations
+            trimmed.starts_with("struct ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("enum ")
+                || trimmed.starts_with("typedef ")
+                || (trimmed.contains('(') && trimmed.ends_with('{'))
+        }
         _ => false,
     }
 }

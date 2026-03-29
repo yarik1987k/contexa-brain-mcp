@@ -122,7 +122,22 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<GetFileContextParams>,
     ) -> Result<CallToolResult, McpError> {
-        let file_path = self.project_path.join(&params.path);
+        // Fix path duplication: if Claude passes "project-name/src/foo.js" but the project root is
+        // already "/path/to/project-name", strip the leading directory component to avoid
+        // resolving to "/path/to/project-name/project-name/src/foo.js".
+        let relative = {
+            let p = std::path::Path::new(&params.path);
+            if let Some(project_dir_name) = self.project_path.file_name() {
+                if let Ok(stripped) = p.strip_prefix(project_dir_name) {
+                    stripped.to_path_buf()
+                } else {
+                    p.to_path_buf()
+                }
+            } else {
+                p.to_path_buf()
+            }
+        };
+        let file_path = self.project_path.join(&relative);
         let mode = params.mode.unwrap_or_else(|| "summary".to_string());
         let budget = params.token_budget.unwrap_or(3000);
 
