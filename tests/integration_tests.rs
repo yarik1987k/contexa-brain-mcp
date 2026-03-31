@@ -241,3 +241,105 @@ fn test_token_estimator_handles_unicode() {
     let tokens = estimate_tokens(text);
     assert!(tokens > 0);
 }
+
+// ── Word boundary matching tests ─────────────────────────────────────
+
+#[test]
+fn test_word_boundary_no_false_positive() {
+    use context_brain::context::relevance_scorer::has_word_match;
+    // "get" should NOT match inside "target"
+    assert!(!has_word_match("target", "get"));
+    // "get" should NOT match inside "budget"
+    assert!(!has_word_match("budget", "get"));
+}
+
+#[test]
+fn test_word_boundary_true_positive() {
+    use context_brain::context::relevance_scorer::has_word_match;
+    // "get" should match in "getUser"
+    assert!(has_word_match("getUser", "get"));
+    // "get" should match in "get_user"
+    assert!(has_word_match("get_user", "get"));
+    // "get" should match standalone
+    assert!(has_word_match("get", "get"));
+    // "auth" should match in "handle_auth_request"
+    assert!(has_word_match("handle_auth_request", "auth"));
+}
+
+// ── Import comment skipping tests ────────────────────────────────────
+
+#[test]
+fn test_js_imports_skip_comments() {
+    let source = r#"
+// import { hidden } from './secret';
+/* import { also_hidden } from './other'; */
+import { real } from './utils';
+"#;
+    let imports = context_brain::indexer::import_extractor::extract_imports(source, "js");
+    assert!(imports.contains(&"./utils".to_string()));
+    assert!(!imports.iter().any(|i| i.contains("secret")));
+    assert!(!imports.iter().any(|i| i.contains("other")));
+}
+
+#[test]
+fn test_python_imports_skip_comments() {
+    let source = "# import hidden\nimport real_module\n";
+    let imports = context_brain::indexer::import_extractor::extract_imports(source, "py");
+    assert!(imports.contains(&"real_module".to_string()));
+    assert!(!imports.iter().any(|i| i.contains("hidden")));
+}
+
+// ── Relevance scoring tests ──────────────────────────────────────────
+
+#[test]
+fn test_score_symbols_exact_match_highest() {
+    use context_brain::indexer::symbol_extractor::{Symbol, SymbolKind};
+    use context_brain::context::relevance_scorer::score_symbols_batch;
+
+    let symbols = vec![
+        Symbol {
+            name: "processAuth".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 1, end_line: 10,
+            signature: "fn processAuth()".to_string(),
+            code: "fn processAuth() { }".to_string(),
+        },
+        Symbol {
+            name: "unrelated".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 20, end_line: 25,
+            signature: "fn unrelated()".to_string(),
+            code: "fn unrelated() { }".to_string(),
+        },
+    ];
+
+    let scores = score_symbols_batch(&symbols, "processAuth", None);
+    assert!(scores[0] > scores[1], "Exact match should score higher: {} vs {}", scores[0], scores[1]);
+}
+
+#[test]
+fn test_score_symbols_substring_match() {
+    use context_brain::indexer::symbol_extractor::{Symbol, SymbolKind};
+    use context_brain::context::relevance_scorer::score_symbols_batch;
+
+    let symbols = vec![
+        Symbol {
+            name: "handleAuth".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 1, end_line: 5,
+            signature: "fn handleAuth()".to_string(),
+            code: "fn handleAuth() {}".to_string(),
+        },
+    ];
+
+    let scores = score_symbols_batch(&symbols, "auth", None);
+    assert!(scores[0] > 0.0, "Substring match should score > 0: {}", scores[0]);
+}
+
+// ── Embedding model availability check ───────────────────────────────
+
+#[test]
+fn test_model_availability_returns_bool() {
+    // Just verify it doesn't panic — actual availability depends on environment
+    let _ = context_brain::indexer::embedding_client::is_model_available();
+}

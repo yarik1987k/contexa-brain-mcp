@@ -48,8 +48,11 @@ impl TurboQuant {
     }
 
     /// Quantize a vector. `bits` must be 1-4.
-    pub fn quantize(&self, vector: &[f32], bits: u8, mode: QuantMode) -> QuantizedVector {
-        assert!((1..=4).contains(&bits), "bits must be 1-4, got {}", bits);
+    /// Returns Err if bits is out of range.
+    pub fn quantize(&self, vector: &[f32], bits: u8, mode: QuantMode) -> Result<QuantizedVector, &'static str> {
+        if !(1..=4).contains(&bits) {
+            return Err("bits must be 1-4");
+        }
         let d = vector.len();
         let padded_dim = self.padded_dim;
 
@@ -61,7 +64,7 @@ impl TurboQuant {
         let norm = l2_norm(&vec);
 
         if norm == 0.0 {
-            return QuantizedVector {
+            return Ok(QuantizedVector {
                 mse_indices: vec![0u8; (padded_dim * bits as usize + 7) / 8],
                 norm: 0.0,
                 qjl_bits: None,
@@ -70,7 +73,7 @@ impl TurboQuant {
                 mode,
                 original_dim: d,
                 padded_dim,
-            };
+            });
         }
 
         // Normalize to unit sphere (in-place, reuse vec)
@@ -92,10 +95,10 @@ impl TurboQuant {
 
         let indices = quantize_vector(&rotated, codebook);
         let packed = pack_indices(&indices, mse_bits)
-            .expect("Internal error: invalid mse_bits in quantize");
+            .map_err(|_| "Internal error: invalid mse_bits")?;
 
         if mode == QuantMode::Fast {
-            return QuantizedVector {
+            return Ok(QuantizedVector {
                 mse_indices: packed,
                 norm,
                 qjl_bits: None,
@@ -104,7 +107,7 @@ impl TurboQuant {
                 mode,
                 original_dim: d,
                 padded_dim,
-            };
+            });
         }
 
         // Unbiased mode: compute residual and apply QJL
@@ -128,7 +131,7 @@ impl TurboQuant {
             None
         };
 
-        QuantizedVector {
+        Ok(QuantizedVector {
             mse_indices: packed,
             norm,
             qjl_bits,
@@ -137,7 +140,7 @@ impl TurboQuant {
             mode,
             original_dim: d,
             padded_dim,
-        }
+        })
     }
 
     /// Dequantize back to approximate float vector.
@@ -191,8 +194,13 @@ impl TurboQuant {
         };
 
         let mut dot = 0.0f32;
+        let num_centroids = codebook.centroids.len();
         for i in 0..d {
-            dot += query_rotated[i] * codebook.centroids[indices[i] as usize];
+            let idx = indices[i] as usize;
+            if idx >= num_centroids {
+                return 0.0; // Corrupted embedding data
+            }
+            dot += query_rotated[i] * codebook.centroids[idx];
         }
 
         (dot * quantized.norm) / (query_norm * quantized.norm)

@@ -57,8 +57,26 @@ fn resolve_import(
 
 fn extract_js_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
+    let mut in_block_comment = false;
     for line in source.lines() {
         let trimmed = line.trim();
+        // Track block comments
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        // Skip single-line comments
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
         // import ... from 'path' or import ... from "path"
         if trimmed.starts_with("import ") {
             if let Some(path) = extract_quoted_after(trimmed, "from") {
@@ -115,6 +133,9 @@ fn extract_python_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
     for line in source.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+            continue;
+        }
         if trimmed.starts_with("from ") {
             // from foo.bar import baz
             if let Some(module) = trimmed.strip_prefix("from ").and_then(|s| s.split_whitespace().next()) {
@@ -152,6 +173,9 @@ fn extract_rust_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
     for line in source.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
         // use crate::foo::bar
         if trimmed.starts_with("use crate::") {
             let path = trimmed.strip_prefix("use crate::").unwrap_or("");
@@ -177,15 +201,15 @@ fn extract_rust_imports(source: &str) -> Vec<String> {
 fn resolve_rust_import(importing_file: &str, raw: &str, known: &HashSet<String>) -> Option<String> {
     let dir = Path::new(importing_file).parent().unwrap_or(Path::new(""));
 
+    // Use normalize_path to always produce forward-slash paths (cross-platform)
     let candidates = vec![
-        dir.join(format!("{}.rs", raw)).display().to_string(),
-        dir.join(raw).join("mod.rs").display().to_string(),
+        normalize_path(&dir.join(format!("{}.rs", raw))),
+        normalize_path(&dir.join(raw).join("mod.rs")),
         format!("src/{}.rs", raw),
         format!("src/{}/mod.rs", raw),
     ];
 
     candidates.into_iter()
-        .map(|c| normalize_path(Path::new(&c)))
         .find(|c| known.contains(c))
 }
 

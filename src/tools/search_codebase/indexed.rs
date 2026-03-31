@@ -31,18 +31,7 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
              WHERE symbols_fts MATCH ?1
              LIMIT 100"
         )?;
-        let fts_rows: Vec<_> = match fts_stmt.query_map(rusqlite::params![&fts_query], |row| {
-            let sym_blob: Option<Vec<u8>> = row.get(5)?;
-            Ok(SymbolRow {
-                name: row.get(0)?,
-                kind: row.get(1)?,
-                start_line: row.get::<_, i64>(2)?.max(0) as usize,
-                end_line: row.get::<_, i64>(3)?.max(0) as usize,
-                signature: row.get(4)?,
-                embedding: sym_blob.map(|b| schema::blob_to_embedding(&b)),
-                file_path: row.get(6)?,
-            })
-        }) {
+        let fts_rows: Vec<_> = match fts_stmt.query_map(rusqlite::params![&fts_query], SymbolRow::from_row) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
             Err(e) => {
                 tracing::warn!("FTS query failed (falling back to LIKE): {}", e);
@@ -59,18 +48,8 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
              LIMIT 100"
         )?;
         let pattern = format!("%{}%", query_lower);
-        let like_rows: Vec<_> = like_stmt.query_map(rusqlite::params![&pattern], |row| {
-            let sym_blob: Option<Vec<u8>> = row.get(5)?;
-            Ok(SymbolRow {
-                name: row.get(0)?,
-                kind: row.get(1)?,
-                start_line: row.get::<_, i64>(2)?.max(0) as usize,
-                end_line: row.get::<_, i64>(3)?.max(0) as usize,
-                signature: row.get(4)?,
-                embedding: sym_blob.map(|b| schema::blob_to_embedding(&b)),
-                file_path: row.get(6)?,
-            })
-        })?.filter_map(|r| r.ok()).collect();
+        let like_rows: Vec<_> = like_stmt.query_map(rusqlite::params![&pattern], SymbolRow::from_row)?
+            .filter_map(|r| r.ok()).collect();
 
         // Merge FTS + LIKE results, deduplicating
         let mut seen = std::collections::HashSet::new();

@@ -11,7 +11,7 @@ fn test_quantize_dequantize_roundtrip() {
     }
 
     // Quantize at 2 bits (fast mode)
-    let quantized = tq.quantize(&vector, 2, QuantMode::Fast);
+    let quantized = tq.quantize(&vector, 2, QuantMode::Fast).unwrap();
     assert_eq!(quantized.original_dim, 1024);
     assert!(quantized.norm > 0.0);
 
@@ -39,7 +39,7 @@ fn test_fast_cosine_similarity() {
     let exact_sim = cosine_similarity(&v1, &v2);
     println!("Exact cosine similarity: {:.4}", exact_sim);
 
-    let q2 = tq.quantize(&v2, 2, QuantMode::Fast);
+    let q2 = tq.quantize(&v2, 2, QuantMode::Fast).unwrap();
     let (rotated_q1, norm_q1) = tq.prepare_query(&v1);
     let approx_sim = tq.fast_cosine_similarity(&rotated_q1, norm_q1, &q2);
     println!("TurboQuant 2-bit fast cosine similarity: {:.4}", approx_sim);
@@ -66,7 +66,7 @@ fn test_compression_ratio() {
 fn test_zero_vector() {
     let tq = TurboQuant::new(1024);
     let vector = vec![0.0f32; 1024];
-    let quantized = tq.quantize(&vector, 2, QuantMode::Fast);
+    let quantized = tq.quantize(&vector, 2, QuantMode::Fast).unwrap();
     assert_eq!(quantized.norm, 0.0);
 
     let reconstructed = tq.dequantize(&quantized);

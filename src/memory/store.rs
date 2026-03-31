@@ -4,11 +4,7 @@ use anyhow::{Result, bail};
 use crate::db::schema;
 use crate::indexer::embedding_client;
 
-/// Maximum content size for a single memory (50KB).
-const MAX_MEMORY_SIZE: usize = 50 * 1024;
-
-/// Maximum number of memories per project.
-const MAX_MEMORIES: i64 = 1000;
+use crate::context::scoring;
 
 /// Save a memory entry with embedding to the persistent SQLite store.
 pub fn save(project_path: &Path, content: &str, category: &str, tags: &str) -> Result<()> {
@@ -16,11 +12,11 @@ pub fn save(project_path: &Path, content: &str, category: &str, tags: &str) -> R
     if content.is_empty() {
         bail!("Memory content cannot be empty");
     }
-    if content.len() > MAX_MEMORY_SIZE {
+    if content.len() > scoring::MAX_MEMORY_SIZE {
         bail!(
             "Memory content too large ({:.1}KB). Max is {}KB.",
             content.len() as f64 / 1024.0,
-            MAX_MEMORY_SIZE / 1024
+            scoring::MAX_MEMORY_SIZE / 1024
         );
     }
     if category.len() > 100 {
@@ -35,10 +31,10 @@ pub fn save(project_path: &Path, content: &str, category: &str, tags: &str) -> R
     // Check memory count limit
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
-    if count >= MAX_MEMORIES {
+    if count >= scoring::MAX_MEMORIES {
         bail!(
             "Memory limit reached ({}/{}). Delete old memories before adding new ones.",
-            count, MAX_MEMORIES
+            count, scoring::MAX_MEMORIES
         );
     }
 

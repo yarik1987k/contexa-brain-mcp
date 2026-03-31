@@ -26,6 +26,23 @@ pub(super) struct SymbolRow {
     pub file_path: String,
 }
 
+impl SymbolRow {
+    /// Map a rusqlite row to a SymbolRow. Expects columns:
+    /// 0=name, 1=kind, 2=start_line(i64), 3=end_line(i64), 4=signature, 5=embedding(blob), 6=file_path
+    pub fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        let sym_blob: Option<Vec<u8>> = row.get(5)?;
+        Ok(Self {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            start_line: row.get::<_, i64>(2)?.max(0) as usize,
+            end_line: row.get::<_, i64>(3)?.max(0) as usize,
+            signature: row.get(4)?,
+            embedding: sym_blob.map(|b| crate::db::schema::blob_to_embedding(&b)),
+            file_path: row.get(6)?,
+        })
+    }
+}
+
 /// Insert or update a match entry using O(1) HashMap lookup instead of linear scan.
 pub(super) fn upsert_match(
     matches: &mut Vec<SearchMatch>,
@@ -50,7 +67,7 @@ pub(super) fn upsert_match(
         }
     } else {
         // Cap total unique matches to prevent unbounded memory growth
-        if matches.len() >= 500 {
+        if matches.len() >= crate::context::scoring::MAX_SEARCH_MATCHES {
             return;
         }
         let idx = matches.len();
@@ -65,6 +82,11 @@ pub(super) fn upsert_match(
 }
 
 pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget: u32, output: &mut String) -> Result<()> {
+    // Warn user if semantic search is unavailable
+    if !crate::indexer::embedding_client::is_model_available() {
+        writeln!(output, "**Warning:** Embedding model failed to load. Results use keyword matching only (no semantic search).\n")?;
+    }
+
     if matches.is_empty() {
         writeln!(output, "No results found for: '{}'", query)?;
         return Ok(());

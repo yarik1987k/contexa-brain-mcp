@@ -27,8 +27,10 @@ pub fn index_project(project_path: &Path) -> Result<IndexStats> {
 
     tracing::info!("Indexing {} files...", files.len());
 
-    // ── Phase 1: Collect files that need (re-)indexing ────────────────
+    // ── Phase 1: Read all files, collect those needing (re-)indexing ───
+    // Cache all content to avoid re-reading during import analysis (Phase 5).
     let mut to_index: Vec<PendingFile> = Vec::new();
+    let mut all_file_content: Vec<(String, String, String)> = Vec::with_capacity(files.len());
 
     for file in &files {
         let content = match std::fs::read_to_string(&file.absolute_path) {
@@ -39,6 +41,9 @@ pub fn index_project(project_path: &Path) -> Result<IndexStats> {
                 continue;
             }
         };
+
+        // Cache for import analysis regardless of whether file needs re-indexing
+        all_file_content.push((file.relative_path.clone(), file.extension.clone(), content.clone()));
 
         let content_hash = hash_content(&content);
 
@@ -75,24 +80,10 @@ pub fn index_project(project_path: &Path) -> Result<IndexStats> {
     stats.files_indexed = to_index.len();
 
     // ── Phase 5: Build import graph and compute centrality ──────────
+    // Uses all_file_content cached during Phase 1 — no re-reading from disk.
     tracing::info!("Computing import centrality...");
-    let known_paths: HashSet<String> = files.iter().map(|f| f.relative_path.clone()).collect();
-    let mut all_file_data: Vec<(String, String, String)> = Vec::new();
-
-    // Use content from to_index where available, read the rest from disk
-    let indexed_paths: HashSet<String> = to_index.iter().map(|f| f.relative_path.clone()).collect();
-    for file in &to_index {
-        all_file_data.push((file.relative_path.clone(), file.extension.clone(), file.content.clone()));
-    }
-    for file in &files {
-        if !indexed_paths.contains(&file.relative_path) {
-            if let Ok(content) = std::fs::read_to_string(&file.absolute_path) {
-                all_file_data.push((file.relative_path.clone(), file.extension.clone(), content));
-            }
-        }
-    }
-
-    let import_counts = import_extractor::build_import_counts(&all_file_data, &known_paths);
+    let known_paths: HashSet<String> = all_file_content.iter().map(|(p, _, _)| p.clone()).collect();
+    let import_counts = import_extractor::build_import_counts(&all_file_content, &known_paths);
     if !import_counts.is_empty() {
         if let Err(e) = schema::update_import_counts(&conn, &import_counts) {
             tracing::warn!("Failed to update import counts: {}", e);
@@ -156,7 +147,7 @@ fn embed_and_store(conn: &rusqlite::Connection, to_index: &[PendingFile]) -> Res
 
     // Batch-generate file embeddings
     let file_summaries: Vec<String> = to_index.iter()
-        .map(|f| format!("{} {}", f.relative_path, f.content.chars().take(500).collect::<String>()))
+        .map(|f| format!("{} {}", f.relative_path, f.content.chars().take(crate::context::scoring::FILE_SUMMARY_CHARS).collect::<String>()))
         .collect();
     let summary_refs: Vec<&str> = file_summaries.iter().map(|s| s.as_str()).collect();
     let file_embeddings = embedding_client::try_embed_batch(&summary_refs);
@@ -172,7 +163,7 @@ fn embed_and_store(conn: &rusqlite::Connection, to_index: &[PendingFile]) -> Res
         if super::config::has_ast_support(&file.extension) {
             if let Ok(extracted) = symbol_extractor::extract_symbols(&file.content, &file.extension) {
                 for sym in extracted {
-                    if sym.end_line.saturating_sub(sym.start_line) > 3 {
+                    if sym.end_line.saturating_sub(sym.start_line) > crate::context::scoring::MIN_SYMBOL_LINES_FOR_EMBEDDING {
                         embed_map.push((file_idx, symbols.len()));
                         embed_texts.push(format!("{} {}", sym.name, sym.signature));
                     }

@@ -90,7 +90,7 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
     for (sname, kind, start_line, end_line, _sig, rel_path) in &results {
         let file_path = project_path.join(rel_path);
         let resolved = file_path.canonicalize()
-            .map_err(|_| anyhow::anyhow!("Cannot resolve path: {}", rel_path))?;
+            .map_err(|e| anyhow::anyhow!("Cannot resolve path {}: {}", rel_path, e))?;
         let canonical_project = project_path.canonicalize().unwrap_or_else(|_| project_path.to_path_buf());
         if !resolved.starts_with(&canonical_project) {
             bail!("Path escapes project directory: {}", rel_path);

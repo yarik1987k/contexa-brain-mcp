@@ -33,3 +33,39 @@ pub const RELEVANCE_SIM_THRESHOLD: f32 = 0.3;
 
 /// Minimum score for a memory to be included in recall results.
 pub const MEMORY_MIN_SCORE: f32 = 0.15;
+
+// ── Indexing pipeline ────────────────────────────────────────────────
+
+/// Minimum symbol span (lines) to generate an embedding for.
+/// Symbols shorter than this get indexed but without embeddings (saves model calls).
+pub const MIN_SYMBOL_LINES_FOR_EMBEDDING: usize = 3;
+
+/// Max chars of file content used to generate the file-level embedding summary.
+pub const FILE_SUMMARY_CHARS: usize = 500;
+
+/// Minimum remaining token budget before stopping symbol packing.
+pub const MIN_BUDGET_TOKENS: u32 = 20;
+
+/// Maximum memories stored per project.
+pub const MAX_MEMORIES: i64 = 1000;
+
+/// Maximum content size for a single memory (bytes).
+pub const MAX_MEMORY_SIZE: usize = 50 * 1024;
+
+/// Maximum search matches held in memory before truncation.
+pub const MAX_SEARCH_MATCHES: usize = 500;
+
+/// Maximum memories loaded per recall query.
+pub const MAX_RECALL_CANDIDATES: usize = 100;
+
+// ── Memory scoring weights ───────────────────────────────────────────
+
+/// Weight for semantic similarity in memory recall scoring.
+pub const MEMORY_SEMANTIC_WEIGHT: f32 = 0.7;
+/// Weight for keyword matching in memory recall scoring.
+pub const MEMORY_KEYWORD_WEIGHT: f32 = 0.2;
+/// Weight for recency bonus in memory recall scoring.
+pub const MEMORY_RECENCY_WEIGHT: f32 = 0.1;
+
+/// Max chars of file content used for embedding in live search.
+pub const LIVE_SEARCH_SUMMARY_CHARS: usize = 300;

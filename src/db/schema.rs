@@ -142,11 +142,7 @@ pub fn upsert_file(
     embedding: Option<&[f32]>,
     embedding_compressed: Option<&[u8]>,
 ) -> Result<i64> {
-    let embedding_blob = embedding.map(|e| {
-        e.iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect::<Vec<u8>>()
-    });
+    let embedding_blob = embedding_to_blob(embedding);
 
     conn.execute(
         "INSERT INTO files (relative_path, extension, size_bytes, line_count, content_hash, embedding, embedding_compressed, last_indexed)
@@ -187,11 +183,7 @@ pub fn insert_symbol(
     embedding: Option<&[f32]>,
     embedding_compressed: Option<&[u8]>,
 ) -> Result<()> {
-    let embedding_blob = embedding.map(|e| {
-        e.iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect::<Vec<u8>>()
-    });
+    let embedding_blob = embedding_to_blob(embedding);
 
     let symbol_id = {
         conn.execute(
@@ -231,6 +223,15 @@ pub fn delete_file_symbols(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Serialize an f32 embedding slice to a byte blob for SQLite storage.
+pub fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
+    embedding.map(|e| {
+        e.iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect::<Vec<u8>>()
+    })
+}
+
 /// Read an embedding blob back into a Vec<f32>.
 /// Returns empty vec if blob length is not a multiple of 4 (corrupted data).
 pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
@@ -252,11 +253,7 @@ pub fn insert_memory(
     embedding: Option<&[f32]>,
     embedding_compressed: Option<&[u8]>,
 ) -> Result<i64> {
-    let embedding_blob = embedding.map(|e| {
-        e.iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect::<Vec<u8>>()
-    });
+    let embedding_blob = embedding_to_blob(embedding);
 
     conn.execute(
         "INSERT INTO memories (content, category, tags, embedding, embedding_compressed)

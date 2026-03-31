@@ -71,7 +71,7 @@ pub fn smart_summarize(
     let mut sig_count = 0usize;
 
     for (score, sym) in &scored {
-        if remaining_budget < 20 {
+        if remaining_budget < scoring::MIN_BUDGET_TOKENS {
             break;
         }
 

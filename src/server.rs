@@ -102,6 +102,11 @@ impl ContextBrainServer {
             }
         }
 
+        // Check embedding model health
+        if !indexer::embedding_client::is_model_available() {
+            tracing::error!("Embedding model failed to load. Semantic search will be unavailable — only keyword matching will work.");
+        }
+
         // Start file watcher for incremental re-indexing
         let watcher = match indexer::watch_manager::WatchManager::start(project_path.clone()) {
             Ok(wm) => {

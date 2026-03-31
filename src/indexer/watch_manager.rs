@@ -44,31 +44,38 @@ impl WatchManager {
 async fn event_loop(project_path: Arc<PathBuf>, rx: std::sync::mpsc::Receiver<Event>) {
     use std::collections::HashSet;
 
+    // Bridge sync mpsc to async via a tokio channel
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    // Spawn a blocking thread to forward sync events to the async channel
+    std::thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            if async_tx.send(event).is_err() {
+                break; // async side dropped
+            }
+        }
+    });
+
     loop {
-        // Block until first event (via spawn_blocking since rx.recv() is blocking)
-        let first_event = {
-            match rx.recv_timeout(Duration::from_secs(60)) {
-                Ok(e) => e,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    tracing::info!("File watcher channel closed, stopping");
-                    return;
-                }
+        // Wait for first event asynchronously (no busy-wait)
+        let first_event = match async_rx.recv().await {
+            Some(e) => e,
+            None => {
+                tracing::info!("File watcher channel closed, stopping");
+                return;
             }
         };
 
-        // Debounce: collect events for 500ms
+        // Debounce: sleep 500ms, collecting any events that arrive
         let mut changed_paths: HashSet<PathBuf> = HashSet::new();
         let mut deleted_paths: HashSet<PathBuf> = HashSet::new();
 
         classify_event(&first_event, &mut changed_paths, &mut deleted_paths);
 
-        let debounce_until = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < debounce_until {
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(event) => classify_event(&event, &mut changed_paths, &mut deleted_paths),
-                Err(_) => {}
-            }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Drain all events that accumulated during the sleep
+        while let Ok(event) = async_rx.try_recv() {
+            classify_event(&event, &mut changed_paths, &mut deleted_paths);
         }
 
         // Filter to source files within the project

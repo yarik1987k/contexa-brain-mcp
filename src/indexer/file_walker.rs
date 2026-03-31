@@ -30,7 +30,10 @@ pub fn walk_project(project_path: &Path) -> Result<Vec<FileEntry>> {
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::debug!("File walker skipped entry: {}", e);
+                continue;
+            }
         };
 
         // Skip directories

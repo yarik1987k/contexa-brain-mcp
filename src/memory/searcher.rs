@@ -32,17 +32,22 @@ pub fn recall(
     });
 
     // Load memories
+    let limit = crate::context::scoring::MAX_RECALL_CANDIDATES;
     let memories = if let Some(cat) = category {
-        let mut s = conn.prepare(
+        let sql = format!(
             "SELECT id, content, category, tags, created_at, embedding, embedding_compressed
-             FROM memories WHERE category = ?1 ORDER BY created_at DESC LIMIT 100",
-        )?;
+             FROM memories WHERE category = ?1 ORDER BY created_at DESC LIMIT {}",
+            limit
+        );
+        let mut s = conn.prepare(&sql)?;
         collect_memories(&mut s, Some(cat))?
     } else {
-        let mut s = conn.prepare(
+        let sql = format!(
             "SELECT id, content, category, tags, created_at, embedding, embedding_compressed
-             FROM memories ORDER BY created_at DESC LIMIT 100",
-        )?;
+             FROM memories ORDER BY created_at DESC LIMIT {}",
+            limit
+        );
+        let mut s = conn.prepare(&sql)?;
         collect_memories(&mut s, None)?
     };
 
@@ -58,38 +63,36 @@ pub fn recall(
         .map(|(i, row)| {
             let mut score: f32 = 0.0;
 
-            // Semantic similarity (0.7 weight) — prefer compressed, fall back to raw
+            use crate::context::scoring;
+
+            // Semantic similarity — prefer compressed, fall back to raw
             if let Some((qe, ref rotated, norm)) = query_prepared {
                 if let Some(ref blob) = row.embedding_compressed {
-                    // Fast path: TurboQuant compressed similarity
                     if let Some(qv) = schema::blob_to_quantized(blob) {
                         let sim = tq.fast_cosine_similarity(rotated, norm, &qv);
-                        score += sim * 0.7;
+                        score += sim * scoring::MEMORY_SEMANTIC_WEIGHT;
                     }
                 } else if let Some(ref me) = row.embedding {
-                    // Fallback: raw f32 cosine similarity
                     let sim = embedding_client::cosine_similarity(qe, me);
-                    score += sim * 0.7;
+                    score += sim * scoring::MEMORY_SEMANTIC_WEIGHT;
                 }
             }
 
-            // Keyword match (0.2 weight)
+            // Keyword match
             let query_lower = query.to_lowercase();
             let content_lower = row.content.to_lowercase();
             if content_lower.contains(&query_lower) {
-                score += 0.2;
+                score += scoring::MEMORY_KEYWORD_WEIGHT;
             } else {
-                // Partial word matching
                 let query_words: Vec<&str> = query_lower.split_whitespace().collect();
                 let matches = query_words.iter().filter(|w| content_lower.contains(*w)).count();
                 if !query_words.is_empty() {
-                    score += 0.2 * (matches as f32 / query_words.len() as f32);
+                    score += scoring::MEMORY_KEYWORD_WEIGHT * (matches as f32 / query_words.len() as f32);
                 }
             }
 
-            // Recency bonus (0.1 weight) — newer memories score higher
-            // Index 0 = most recent (ORDER BY created_at DESC), decays linearly
-            score += 0.1 * (1.0 - i as f32 / total.max(1.0));
+            // Recency bonus — newer memories score higher
+            score += scoring::MEMORY_RECENCY_WEIGHT * (1.0 - i as f32 / total.max(1.0));
 
             (score, row)
         })

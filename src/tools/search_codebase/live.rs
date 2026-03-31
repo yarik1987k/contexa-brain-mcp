@@ -59,7 +59,7 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
         if has_ast {
             if let Ok(symbols) = symbol_extractor::extract_symbols(&content, &file.extension) {
                 for sym in &symbols {
-                    if is_word_match(&sym.name.to_lowercase(), &query_lower) {
+                    if crate::context::relevance_scorer::has_word_match(&sym.name.to_lowercase(), &query_lower) {
                         score += scoring::SEARCH_SUBSTRING_NAME_BONUS;
                         if symbol_matches.len() < 5 {
                             symbol_matches.push(format!(
@@ -73,12 +73,12 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
         }
 
         if score > 0.0 {
-            let summary = format!("{}\n{}", file.relative_path, content.chars().take(300).collect::<String>());
+            let summary = format!("{}\n{}", file.relative_path, content.chars().take(scoring::LIVE_SEARCH_SUMMARY_CHARS).collect::<String>());
             candidates.push(Candidate {
                 relative_path: file.relative_path.clone(),
                 score, context_lines, symbol_matches, summary,
             });
-            if candidates.len() >= 500 {
+            if candidates.len() >= crate::context::scoring::MAX_SEARCH_MATCHES {
                 break;
             }
         }
@@ -112,19 +112,4 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
 
     format_results(&matches, query, token_budget, &mut output)?;
     Ok(output)
-}
-
-/// Check if query appears as a word boundary match (not substring of unrelated word).
-fn is_word_match(haystack: &str, needle: &str) -> bool {
-    if let Some(pos) = haystack.find(needle) {
-        let before_ok = pos == 0 || !haystack.as_bytes()[pos - 1].is_ascii_alphanumeric();
-        let after_pos = pos + needle.len();
-        let after_ok = after_pos >= haystack.len() || !haystack.as_bytes()[after_pos].is_ascii_alphanumeric();
-        // Also allow camelCase/snake_case boundaries
-        let after_ok = after_ok || haystack.as_bytes().get(after_pos).map(|b| *b == b'_' || b.is_ascii_uppercase()).unwrap_or(true);
-        let before_ok = before_ok || haystack.as_bytes().get(pos.wrapping_sub(1)).map(|b| *b == b'_').unwrap_or(true);
-        before_ok || after_ok
-    } else {
-        false
-    }
 }

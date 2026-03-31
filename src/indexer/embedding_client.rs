@@ -62,27 +62,57 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 
 const MAX_EMBED_INPUT: usize = 8192;
 
+/// Timeout for a single embedding call (covers model download, inference, hangs).
+const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run an embedding operation with a timeout. The closure runs in a spawned thread
+/// that acquires the model lock itself — avoiding the MutexGuard-not-Send problem.
+fn embed_with_timeout<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(EMBED_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(anyhow::anyhow!("Embedding timed out after {}s", EMBED_TIMEOUT.as_secs()))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow::anyhow!("Embedding thread panicked"))
+        }
+    }
+}
+
 impl EmbeddingProvider for FastEmbedProvider {
     fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let text = truncate_utf8(text, MAX_EMBED_INPUT);
-        let model = acquire_model()?;
-        let embeddings = model.embed(vec![text], None)?;
-        embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No embedding returned"))
+        let text = truncate_utf8(text, MAX_EMBED_INPUT).to_string();
+        embed_with_timeout(move || {
+            let model = acquire_model()?;
+            let embeddings = model.embed(vec![text.as_str()], None)?;
+            embeddings
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("No embedding returned"))
+        })
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let capped: Vec<&str> = texts.iter().map(|t| truncate_utf8(t, MAX_EMBED_INPUT)).collect();
-        let model = acquire_model()?;
-        let embeddings = model.embed(capped, None)?;
-        Ok(embeddings)
+        let capped: Vec<String> = texts.iter()
+            .map(|t| truncate_utf8(t, MAX_EMBED_INPUT).to_string())
+            .collect();
+        embed_with_timeout(move || {
+            let model = acquire_model()?;
+            let refs: Vec<&str> = capped.iter().map(|s| s.as_str()).collect();
+            Ok(model.embed(refs, None)?)
+        })
     }
-
 }
 
 // ── Free functions delegating to global FastEmbedProvider ──────────────
@@ -146,6 +176,12 @@ pub fn try_embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
     }
 }
 
+/// Returns true if the embedding model loaded successfully.
+/// Call this to check whether semantic search is available.
+pub fn is_model_available() -> bool {
+    MODEL.as_ref().is_ok()
+}
+
 /// Embedding dimension for the current model (MultilingualE5Small = 384).
 pub const EMBEDDING_DIM: usize = 384;
 
@@ -164,5 +200,7 @@ pub fn get_turboquant() -> &'static TurboQuant {
 
 /// Quantize an embedding using TurboQuant (2-bit, fast mode).
 pub fn quantize_embedding(embedding: &[f32]) -> QuantizedVector {
+    // bits=2 is always valid (1-4 range), so unwrap is safe here
     TURBOQUANT.quantize(embedding, 2, QuantMode::Fast)
+        .expect("bits=2 is always valid")
 }

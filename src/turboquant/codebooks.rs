@@ -87,10 +87,12 @@ pub fn quantize_vector(rotated: &[f32], codebook: &Codebook) -> Vec<u8> {
 }
 
 /// Dequantize index array back to centroid values.
+/// Clamps out-of-range indices to the last centroid to avoid panics on corrupted data.
 pub fn dequantize_vector(indices: &[u8], codebook: &Codebook) -> Vec<f32> {
+    let max_idx = codebook.centroids.len().saturating_sub(1);
     indices
         .iter()
-        .map(|&idx| codebook.centroids[idx as usize])
+        .map(|&idx| codebook.centroids[(idx as usize).min(max_idx)])
         .collect()
 }
 
