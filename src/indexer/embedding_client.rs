@@ -5,9 +5,9 @@ use std::sync::Mutex;
 /// Global embedding model — initialized once, reused across calls.
 static MODEL: std::sync::LazyLock<Result<Mutex<TextEmbedding>, String>> =
     std::sync::LazyLock::new(|| {
-        eprintln!("[context-brain] Initializing embedding model (first run may download ~23MB)...");
+        eprintln!("[context-brain] Initializing embedding model (multilingual-e5-small, first run may download ~90MB)...");
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            InitOptions::new(EmbeddingModel::MultilingualE5Small)
                 .with_show_download_progress(true),
         )
         .map_err(|e| format!("Failed to init embedding model: {}", e))?;
@@ -95,7 +95,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Embedding dimension for the current model (AllMiniLML6V2 = 384).
+/// Embedding dimension for the current model (MultilingualE5Small = 384).
 pub const EMBEDDING_DIM: usize = 384;
 
 // ── TurboQuant integration ──────────────────────────────────────────
