@@ -160,6 +160,19 @@ fn structural_summary(
                         "- [{}] **{}** (L{}-L{}, {} lines): `{}`",
                         sym.kind, sym.name, sym.start_line, sym.end_line, span, sym.signature
                     )?;
+
+                    // For large functions (200+ lines), extract inner structure
+                    if span >= 200 && matches!(sym.kind, symbol_extractor::SymbolKind::Function
+                        | symbol_extractor::SymbolKind::AsyncFunction) {
+                        let inner = symbol_extractor::extract_inner_symbols(&sym.code, sym.start_line);
+                        if !inner.is_empty() {
+                            writeln!(output, "  Inner structure ({} items):", inner.len())?;
+                            for isym in &inner {
+                                writeln!(output, "  - L{}: `{}`", isym.start_line, isym.signature)?;
+                            }
+                        }
+                    }
+
                     if output.len() > char_budget {
                         writeln!(output, "\n... [TRUNCATED — budget reached]")?;
                         break;

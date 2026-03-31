@@ -223,6 +223,16 @@ pub fn delete_file_symbols(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Remove orphaned FTS entries that reference non-existent symbols.
+/// This can happen if a previous indexing run was interrupted mid-transaction.
+pub fn cleanup_orphaned_fts(conn: &Connection) -> Result<usize> {
+    let removed = conn.execute(
+        "DELETE FROM symbols_fts WHERE rowid NOT IN (SELECT id FROM symbols)",
+        [],
+    )?;
+    Ok(removed)
+}
+
 /// Serialize an f32 embedding slice to a byte blob for SQLite storage.
 pub fn embedding_to_blob(embedding: Option<&[f32]>) -> Option<Vec<u8>> {
     embedding.map(|e| {

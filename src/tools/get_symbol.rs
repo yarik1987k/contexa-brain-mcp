@@ -12,13 +12,14 @@ pub fn get_symbol(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
     // Try indexed database first
     if db_path.exists() {
         if let Ok(result) = get_from_index(project_path, name, file_hint) {
-            if !result.is_empty() {
+            // Only accept index results if they contain actual code (not just "Similar symbols" suggestions)
+            if !result.is_empty() && !result.starts_with("No exact match") {
                 return Ok(result);
             }
         }
     }
 
-    // Fallback: grep-like search through files
+    // Fallback: grep-like search through files — catches patterns the AST index missed
     get_from_files(project_path, name, file_hint)
 }
 
@@ -86,8 +87,44 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
         return Ok(output);
     }
 
+    // Resolve Export symbols with small spans — look for the actual Function definition
+    let mut resolved_results: Vec<(String, String, i64, i64, String, String)> = Vec::new();
+    for (sname, kind, start_line, end_line, sig, rel_path) in results {
+        if kind == "Export" && (end_line - start_line) < 5 {
+            // Try to find a Function/AsyncFunction with the same name in the same file
+            let mut resolve_stmt = conn.prepare(
+                "SELECT s.name, s.kind, s.start_line, s.end_line, s.signature, f.relative_path
+                 FROM symbols s JOIN files f ON s.file_id = f.id
+                 WHERE LOWER(s.name) = ?1 AND f.relative_path = ?2
+                   AND s.kind IN ('Function', 'AsyncFunction')
+                 ORDER BY (s.end_line - s.start_line) DESC
+                 LIMIT 1"
+            )?;
+            let func_match: Option<(String, String, i64, i64, String, String)> = resolve_stmt
+                .query_map(rusqlite::params![&sname.to_lowercase(), &rel_path], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+                })?
+                .filter_map(|r| r.ok())
+                .next();
+
+            if let Some(func) = func_match {
+                resolved_results.push(func);
+            } else {
+                resolved_results.push((sname, kind, start_line, end_line, sig, rel_path));
+            }
+        } else {
+            resolved_results.push((sname, kind, start_line, end_line, sig, rel_path));
+        }
+    }
+
+    // Deduplicate by (file, start_line)
+    {
+        let mut seen = std::collections::HashSet::new();
+        resolved_results.retain(|r| seen.insert((r.5.clone(), r.2)));
+    }
+
     // For each match, read the actual code from the file
-    for (sname, kind, start_line, end_line, _sig, rel_path) in &results {
+    for (sname, kind, start_line, end_line, _sig, rel_path) in &resolved_results {
         let file_path = project_path.join(rel_path);
         let resolved = file_path.canonicalize()
             .map_err(|e| anyhow::anyhow!("Cannot resolve path {}: {}", rel_path, e))?;
@@ -164,6 +201,75 @@ fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
                     }
                     writeln!(&mut output)?;
                 }
+            }
+        }
+    }
+
+    // If AST extraction found nothing, try raw text search as last resort
+    if output.is_empty() {
+        for file in &files {
+            let content = match std::fs::read_to_string(&file.absolute_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Find lines containing the symbol name
+            let mut match_lines: Vec<(usize, &str)> = Vec::new();
+            for (i, line) in content.lines().enumerate() {
+                if line.contains(name) {
+                    match_lines.push((i, line));
+                }
+            }
+
+            if match_lines.is_empty() {
+                continue;
+            }
+
+            // Find the best match: prefer definition-like lines
+            let def_line = match_lines.iter().find(|(_, line)| {
+                let trimmed = line.trim();
+                // Definition patterns: function/const/exports assignment (not imports)
+                trimmed.contains(name) && !trimmed.starts_with("import ")
+                    && !trimmed.starts_with("const {") // destructured import
+                    && (trimmed.contains("function") || trimmed.contains("=>")
+                        || trimmed.contains(&format!("exports.{}", name))
+                        || trimmed.contains(&format!("{} =", name))
+                        || trimmed.starts_with(&format!("const {}", name))
+                        || trimmed.starts_with(&format!("let {}", name)))
+            });
+
+            if let Some(&(def_idx, _)) = def_line {
+                let lines: Vec<&str> = content.lines().collect();
+                // Find the end of this function by counting braces
+                let mut brace_count = 0i32;
+                let mut func_end = def_idx;
+                let mut found_open = false;
+                for j in def_idx..lines.len() {
+                    for ch in lines[j].chars() {
+                        if ch == '{' { brace_count += 1; found_open = true; }
+                        if ch == '}' { brace_count -= 1; }
+                    }
+                    func_end = j;
+                    if found_open && brace_count <= 0 {
+                        break;
+                    }
+                    // Safety: don't go past 500 lines
+                    if j - def_idx > 500 { break; }
+                }
+
+                writeln!(
+                    &mut output,
+                    "## [grep match] {} in {} (L{}-L{})\n",
+                    name, file.relative_path, def_idx + 1, func_end + 1
+                )?;
+
+                let ctx_start = def_idx.saturating_sub(2);
+                for i in ctx_start..=func_end.min(lines.len() - 1) {
+                    let prefix = if i < def_idx { "  // " } else { "" };
+                    writeln!(&mut output, "{}L{}: {}", prefix, i + 1, lines[i])?;
+                }
+                writeln!(&mut output)?;
+                break; // Found it
             }
         }
     }

@@ -19,6 +19,11 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
     // Generate query embedding once
     let query_embedding = embedding_client::try_embed_text(query);
 
+    // Split query into words for multi-word matching (used across search phases)
+    let query_words: Vec<&str> = query_lower.split_whitespace()
+        .filter(|w| w.len() >= 2)
+        .collect();
+
     // 1. Search symbols — FTS5 MATCH (fast, ranked) then LIKE fallback (substring)
     {
         let fts_query = format!("\"{}\"*", query_lower.replace('"', "\"\""));
@@ -39,17 +44,29 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
             }
         };
 
-        let mut like_stmt = conn.prepare(
-            "SELECT s.name, s.kind, s.start_line, s.end_line, s.signature, s.embedding,
-                    f.relative_path
-             FROM symbols s JOIN files f ON s.file_id = f.id
-             WHERE LOWER(s.name) LIKE ?1
-             ORDER BY s.name
-             LIMIT 100"
-        )?;
-        let pattern = format!("%{}%", query_lower);
-        let like_rows: Vec<_> = like_stmt.query_map(rusqlite::params![&pattern], SymbolRow::from_row)?
-            .filter_map(|r| r.ok()).collect();
+        let mut like_rows: Vec<SymbolRow> = Vec::new();
+        {
+            let mut like_stmt = conn.prepare(
+                "SELECT s.name, s.kind, s.start_line, s.end_line, s.signature, s.embedding,
+                        f.relative_path
+                 FROM symbols s JOIN files f ON s.file_id = f.id
+                 WHERE LOWER(s.name) LIKE ?1
+                 ORDER BY s.name
+                 LIMIT 100"
+            )?;
+            let mut like_seen = std::collections::HashSet::new();
+            for word in &query_words {
+                let pattern = format!("%{}%", word);
+                let word_rows: Vec<SymbolRow> = like_stmt.query_map(rusqlite::params![&pattern], SymbolRow::from_row)?
+                    .filter_map(|r| r.ok()).collect();
+                for row in word_rows {
+                    let key = format!("{}:{}:{}", row.name, row.file_path, row.start_line);
+                    if like_seen.insert(key) {
+                        like_rows.push(row);
+                    }
+                }
+            }
+        }
 
         // Merge FTS + LIKE results, deduplicating
         let mut seen = std::collections::HashSet::new();
@@ -63,11 +80,19 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
 
         for row in &rows {
             let mut score: f32 = 0.0;
+            let name_lower = row.name.to_lowercase();
 
-            if row.name.to_lowercase() == query_lower {
+            if name_lower == query_lower {
                 score += scoring::SEARCH_EXACT_NAME_BONUS;
-            } else if row.name.to_lowercase().contains(&query_lower) {
+            } else if name_lower.contains(&query_lower) {
                 score += scoring::SEARCH_SUBSTRING_NAME_BONUS;
+            } else if query_words.len() > 1 {
+                // Score by fraction of query words matched in symbol name
+                let matched = query_words.iter().filter(|w| name_lower.contains(*w)).count();
+                if matched > 0 {
+                    let fraction = matched as f32 / query_words.len() as f32;
+                    score += fraction * scoring::SEARCH_SUBSTRING_NAME_BONUS;
+                }
             }
 
             if let (Some(ref qe), Some(ref se)) = (&query_embedding, &row.embedding) {
@@ -78,6 +103,25 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
             }
 
             if score > 0.0 {
+                // Boost definitions, penalize import-only matches
+                let is_definition = matches!(row.kind.as_str(),
+                    "function" | "async function" | "Function" | "AsyncFunction"
+                    | "class" | "Class" | "method" | "Method"
+                    | "struct" | "Struct" | "trait" | "Trait"
+                    | "impl" | "Impl" | "enum" | "Enum"
+                    | "interface" | "Interface" | "type" | "TypeAlias"
+                    | "const" | "Constant");
+                let is_export = row.kind == "export" || row.kind == "Export";
+                let is_small_export = is_export && (row.end_line - row.start_line) < 3;
+
+                if is_definition {
+                    // Definitions get a significant boost
+                    score *= 1.5;
+                } else if is_small_export {
+                    // Small exports (re-exports / imports) get penalized
+                    score *= 0.3;
+                }
+
                 let sym_line = format!(
                     "[{}] {} (L{}-L{}): {}",
                     row.kind, row.name, row.start_line, row.end_line, row.signature
@@ -131,7 +175,7 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
         }
     }
 
-    // 3. Search files by path name match
+    // 3. Search files by path name match — try full query first, then individual words
     {
         let mut stmt = conn.prepare(
             "SELECT relative_path FROM files WHERE LOWER(relative_path) LIKE ?1"
@@ -141,8 +185,27 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
             row.get(0)
         })?.filter_map(|r| r.ok()).collect();
 
-        for path in paths {
-            upsert_match(&mut matches, &mut match_index, &path, scoring::SEARCH_PATH_MATCH_BONUS, None, None);
+        for path in &paths {
+            upsert_match(&mut matches, &mut match_index, path, scoring::SEARCH_PATH_MATCH_BONUS, None, None);
+        }
+
+        // Also match individual query words against file paths
+        if query_words.len() > 1 {
+            let mut all_files_stmt = conn.prepare(
+                "SELECT relative_path FROM files"
+            )?;
+            let all_paths: Vec<String> = all_files_stmt.query_map([], |row| {
+                row.get(0)
+            })?.filter_map(|r| r.ok()).collect();
+
+            for file_path in &all_paths {
+                let path_lower = file_path.to_lowercase();
+                let matched = query_words.iter().filter(|w| path_lower.contains(*w)).count();
+                if matched > 0 {
+                    let fraction = matched as f32 / query_words.len() as f32;
+                    upsert_match(&mut matches, &mut match_index, file_path, fraction * scoring::SEARCH_PATH_MATCH_BONUS, None, None);
+                }
+            }
         }
     }
 
@@ -174,13 +237,33 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
         if m.context_lines.is_empty() {
             let file_path = project_path.join(&m.relative_path);
             if let Ok(content) = std::fs::read_to_string(&file_path) {
+                // Collect all matching lines, then prefer definitions over imports
+                let mut def_lines: Vec<ContextLine> = Vec::new();
+                let mut other_lines: Vec<ContextLine> = Vec::new();
+
                 for (i, line) in content.lines().enumerate() {
-                    if line.to_lowercase().contains(&query_lower) && m.context_lines.len() < 3 {
-                        m.context_lines.push(ContextLine {
-                            line_num: i + 1,
-                            content: line.trim().to_string(),
-                        });
+                    let line_lower = line.to_lowercase();
+                    let matches_query = line_lower.contains(&query_lower)
+                        || query_words.iter().any(|w| line_lower.contains(*w));
+
+                    if matches_query {
+                        let trimmed = line.trim();
+                        let is_import = trimmed.starts_with("import ")
+                            || trimmed.starts_with("const {") && trimmed.contains("require(")
+                            || trimmed.starts_with("from ")
+                            || trimmed.starts_with("#include");
+                        let ctx = ContextLine { line_num: i + 1, content: trimmed.to_string() };
+                        if is_import {
+                            other_lines.push(ctx);
+                        } else {
+                            def_lines.push(ctx);
+                        }
                     }
+                }
+
+                // Prefer definition lines, fill remaining slots with import lines
+                for ctx in def_lines.into_iter().chain(other_lines.into_iter()).take(3) {
+                    m.context_lines.push(ctx);
                 }
             }
         }

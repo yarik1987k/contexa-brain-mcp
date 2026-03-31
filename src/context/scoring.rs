@@ -18,7 +18,8 @@ pub const SEARCH_FILE_SIM_WEIGHT: f32 = 3.0;
 /// Bonus for file path matching the query.
 pub const SEARCH_PATH_MATCH_BONUS: f32 = 4.0;
 /// Maximum boost from import-centrality ranking.
-pub const SEARCH_CENTRALITY_MAX_BOOST: f32 = 2.0;
+/// Reduced from 2.0 to avoid hub files (routes) outscoring leaf implementations.
+pub const SEARCH_CENTRALITY_MAX_BOOST: f32 = 0.5;
 
 // ── Relevance scoring (file_summarizer) ──────────────────────────────
 

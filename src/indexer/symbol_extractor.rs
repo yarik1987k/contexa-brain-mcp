@@ -459,6 +459,234 @@ fn find_c_function_name(node: &Node, source: &str) -> Option<String> {
     }
 }
 
+// ── Inner symbol extraction for large functions ─────────────────────
+
+/// For large functions (200+ lines), extract inner structure using both
+/// tree-sitter AST walking and regex fallback for maximum coverage.
+/// Returns: hooks, named inner functions, handlers, and key declarations.
+pub fn extract_inner_symbols(code: &str, base_line: usize) -> Vec<Symbol> {
+    let mut inner = Vec::new();
+    let mut seen_lines = std::collections::HashSet::new();
+
+    // Phase 1: Try tree-sitter for accurate AST-based extraction
+    // Parse the function body as JS/TS to find nested declarations
+    if let Ok(language) = get_language("js") {
+        let mut parser = Parser::new();
+        if parser.set_language(&language).is_ok() {
+            if let Some(tree) = parser.parse(code, None) {
+                extract_inner_from_ast(&tree.root_node(), code, base_line, &mut inner, &mut seen_lines, 0);
+            }
+        }
+    }
+
+    // Phase 2: Regex fallback for patterns tree-sitter might miss
+    for (i, line) in code.lines().enumerate() {
+        let line_num = base_line + i;
+        if seen_lines.contains(&line_num) {
+            continue;
+        }
+        let trimmed = line.trim();
+
+        if let Some(hook_name) = extract_hook_call(trimmed) {
+            inner.push(Symbol {
+                name: hook_name,
+                kind: SymbolKind::Function,
+                start_line: line_num,
+                end_line: line_num,
+                signature: trimmed.chars().take(120).collect(),
+                code: String::new(),
+            });
+        } else if let Some(name) = extract_inner_declaration(trimmed) {
+            inner.push(Symbol {
+                name,
+                kind: SymbolKind::Function,
+                start_line: line_num,
+                end_line: line_num,
+                signature: trimmed.chars().take(120).collect(),
+                code: String::new(),
+            });
+        }
+    }
+
+    // Sort by line number and deduplicate
+    inner.sort_by_key(|s| s.start_line);
+    inner.dedup_by(|a, b| a.start_line == b.start_line);
+    inner
+}
+
+/// Walk the AST inside a function body to find inner declarations.
+fn extract_inner_from_ast(
+    node: &Node,
+    source: &str,
+    base_line: usize,
+    symbols: &mut Vec<Symbol>,
+    seen: &mut std::collections::HashSet<usize>,
+    depth: usize,
+) {
+    if depth > 5 { return; } // Don't go too deep
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+        let line_num = base_line + child.start_position().row;
+        let end_line = base_line + child.end_position().row;
+
+        match kind {
+            // Inner function declarations
+            "function_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, source);
+                    let sig = source[child.byte_range()].lines().next().unwrap_or("").to_string();
+                    seen.insert(line_num);
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Function,
+                        start_line: line_num,
+                        end_line,
+                        signature: sig.chars().take(120).collect(),
+                        code: String::new(),
+                    });
+                }
+            }
+            // const/let/var declarations — look for function assignments
+            "lexical_declaration" | "variable_declaration" => {
+                let mut dcursor = child.walk();
+                for decl in child.children(&mut dcursor) {
+                    if decl.kind() == "variable_declarator" {
+                        if let Some(name_node) = decl.child_by_field_name("name") {
+                            if let Some(value_node) = decl.child_by_field_name("value") {
+                                let val_kind = value_node.kind();
+                                let name = node_text(&name_node, source);
+                                let sig = source[child.byte_range()].lines().next().unwrap_or("").to_string();
+
+                                if matches!(val_kind, "arrow_function" | "function") {
+                                    seen.insert(line_num);
+                                    symbols.push(Symbol {
+                                        name,
+                                        kind: SymbolKind::Function,
+                                        start_line: line_num,
+                                        end_line,
+                                        signature: sig.chars().take(120).collect(),
+                                        code: String::new(),
+                                    });
+                                } else if matches!(val_kind, "call_expression") {
+                                    // Check for hook calls: useState, useEffect, etc.
+                                    let call_text = node_text(&value_node, source);
+                                    if call_text.starts_with("use") {
+                                        let hook = call_text.split('(').next().unwrap_or("use");
+                                        seen.insert(line_num);
+                                        symbols.push(Symbol {
+                                            name: format!("{} = {}(...)", name, hook),
+                                            kind: SymbolKind::Function,
+                                            start_line: line_num,
+                                            end_line: line_num,
+                                            signature: sig.chars().take(120).collect(),
+                                            code: String::new(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Standalone hook calls like useEffect(() => { ... })
+            "expression_statement" => {
+                let text = source[child.byte_range()].trim_start();
+                if text.starts_with("use") && text.contains('(') {
+                    let hook = text.split('(').next().unwrap_or("use");
+                    if hook.len() > 3 && hook.chars().all(|c| c.is_alphanumeric()) {
+                        seen.insert(line_num);
+                        symbols.push(Symbol {
+                            name: format!("{}(...)", hook),
+                            kind: SymbolKind::Function,
+                            start_line: line_num,
+                            end_line,
+                            signature: text.lines().next().unwrap_or("").chars().take(120).collect(),
+                            code: String::new(),
+                        });
+                    }
+                }
+            }
+            // Recurse into blocks, if-statements, etc. to find deeply nested declarations
+            "statement_block" | "if_statement" | "try_statement" | "switch_body" => {
+                extract_inner_from_ast(&child, source, base_line, symbols, seen, depth + 1);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_hook_call(line: &str) -> Option<String> {
+    // Match: const [x, setX] = useState(...) or const x = useMemo(... or useEffect(...
+    let hooks = ["useState", "useEffect", "useMemo", "useCallback", "useRef", "useReducer",
+                 "useContext", "useLayoutEffect", "useImperativeHandle", "useDebugValue",
+                 "useTransition", "useDeferredValue", "useId"];
+
+    for hook in hooks {
+        if line.contains(hook) && line.contains('(') {
+            // Try to extract the variable name: const [x, ...] = useState or const x = useX
+            if let Some(eq_pos) = line.find('=') {
+                let before = line[..eq_pos].trim();
+                // Extract name from "const name" or "const [name, setName]"
+                let name_part = before.trim_start_matches("const ")
+                    .trim_start_matches("let ")
+                    .trim_start_matches("var ")
+                    .trim();
+                if !name_part.is_empty() {
+                    return Some(format!("{} = {}(...)", name_part, hook));
+                }
+            }
+            // Standalone hook call like useEffect(...)
+            return Some(format!("{}(...)", hook));
+        }
+    }
+    None
+}
+
+fn extract_inner_declaration(line: &str) -> Option<String> {
+    // Match: const/let handleX = (...) => or const/let handleX = function(
+    for prefix in ["const ", "let ", "var "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            if let Some(eq_pos) = rest.find(" = ") {
+                let name = rest[..eq_pos].trim();
+                let after_eq = rest[eq_pos + 3..].trim();
+                // Only match function-like assignments (arrow or function keyword)
+                if after_eq.starts_with('(') || after_eq.starts_with("async ")
+                    || after_eq.starts_with("function") || after_eq.contains("=> {")
+                    || after_eq.contains("=>") {
+                    // Filter out simple value assignments
+                    if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Match: function handleX(...)
+    if let Some(rest) = line.strip_prefix("function ") {
+        if let Some(paren) = rest.find('(') {
+            let name = rest[..paren].trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    // Match: async function handleX(...)
+    if let Some(rest) = line.strip_prefix("async function ") {
+        if let Some(paren) = rest.find('(') {
+            let name = rest[..paren].trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn node_text(node: &Node, source: &str) -> String {

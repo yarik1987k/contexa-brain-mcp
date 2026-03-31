@@ -17,13 +17,9 @@ pub fn build_overview(project_path: &Path) -> Result<String> {
         let doc_path = project_path.join(doc_name);
         if doc_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&doc_path) {
-                // Take first ~1000 chars as summary
-                let summary: String = content.chars().take(1000).collect();
                 writeln!(&mut output, "## From {}\n", doc_name)?;
+                let summary = extract_doc_skeleton(&content, 4000);
                 writeln!(&mut output, "{}", summary)?;
-                if content.len() > 1000 {
-                    writeln!(&mut output, "\n... [truncated, use get_file_context for full content]")?;
-                }
                 writeln!(&mut output)?;
                 break;
             }
@@ -62,40 +58,84 @@ pub fn build_overview(project_path: &Path) -> Result<String> {
     Ok(output)
 }
 
+/// Extract a skeleton from a markdown document: all headers + first paragraph under each.
+/// Preserves document structure within a character budget rather than blindly truncating.
+fn extract_doc_skeleton(content: &str, char_budget: usize) -> String {
+    let mut result = String::new();
+    let mut in_code_block = false;
+    let mut chars_used: usize = 0;
+    let mut lines_since_header: usize = 0;
+    let mut blank_after_content = false;
+
+    for line in content.lines() {
+        // Track code blocks
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+
+        let is_header = !in_code_block && line.starts_with('#');
+        let is_blank = line.trim().is_empty();
+        let is_list = !in_code_block && (line.trim_start().starts_with("- ")
+            || line.trim_start().starts_with("* ")
+            || line.trim_start().starts_with("| "));
+
+        if is_header {
+            // Always include headers
+            if chars_used + line.len() + 2 > char_budget {
+                result.push_str("\n... [remaining sections omitted — use get_file_context for full content]\n");
+                break;
+            }
+            if chars_used > 0 { result.push('\n'); chars_used += 1; }
+            result.push_str(line);
+            result.push('\n');
+            chars_used += line.len() + 1;
+            lines_since_header = 0;
+            blank_after_content = false;
+        } else if lines_since_header < 8 && !blank_after_content {
+            // Include content lines near headers (first paragraph / table / list)
+            if is_blank {
+                if lines_since_header > 0 {
+                    blank_after_content = true;
+                }
+                continue;
+            }
+            if chars_used + line.len() + 2 > char_budget {
+                result.push_str("\n... [truncated — use get_file_context for full content]\n");
+                break;
+            }
+            result.push_str(line);
+            result.push('\n');
+            chars_used += line.len() + 1;
+            lines_since_header += 1;
+        } else if is_list && lines_since_header < 20 && !blank_after_content {
+            // Allow lists to continue a bit longer
+            if chars_used + line.len() + 2 > char_budget { break; }
+            result.push_str(line);
+            result.push('\n');
+            chars_used += line.len() + 1;
+            lines_since_header += 1;
+        }
+    }
+
+    result
+}
+
 fn collect_file_stats(dir: &Path) -> Result<Vec<(String, usize)>> {
+    use crate::indexer::file_walker;
+
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    count_files_recursive(dir, &mut counts, 0, 20)?;
+
+    // Use the gitignore-aware file walker to avoid counting node_modules, venv, etc.
+    if let Ok(files) = file_walker::walk_project(dir) {
+        for file in &files {
+            *counts.entry(file.extension.clone()).or_insert(0) += 1;
+        }
+    }
 
     let mut stats: Vec<_> = counts.into_iter().collect();
     stats.sort_by(|a, b| b.1.cmp(&a.1));
     stats.truncate(15);
     Ok(stats)
-}
-
-fn count_files_recursive(dir: &Path, counts: &mut std::collections::HashMap<String, usize>, depth: usize, max_depth: usize) -> Result<()> {
-    if depth >= max_depth {
-        return Ok(());
-    }
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if crate::indexer::config::is_skip_dir(&name) {
-            continue;
-        }
-
-        let path = entry.path();
-        if path.is_dir() {
-            count_files_recursive(&path, counts, depth + 1, max_depth)?;
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            *counts.entry(ext.to_string()).or_insert(0) += 1;
-        }
-    }
-    Ok(())
 }
 
 fn detect_stack(project_path: &Path) -> Vec<String> {

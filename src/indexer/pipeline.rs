@@ -27,6 +27,33 @@ pub fn index_project(project_path: &Path) -> Result<IndexStats> {
 
     tracing::info!("Indexing {} files...", files.len());
 
+    // ── Cleanup: remove DB entries for files no longer on disk ────────
+    // Prevents stale foreign key references and orphaned symbols/FTS rows.
+    {
+        let current_paths: HashSet<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        let mut stmt = conn.prepare("SELECT relative_path FROM files")?;
+        let db_paths: Vec<String> = stmt.query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut removed = 0;
+        for db_path in &db_paths {
+            if !current_paths.contains(db_path.as_str()) {
+                schema::delete_file_by_path(&conn, db_path)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!("Cleaned up {} stale file entries from index.", removed);
+        }
+
+        // Also clean up orphaned FTS entries from any interrupted previous runs
+        if let Ok(fts_cleaned) = schema::cleanup_orphaned_fts(&conn) {
+            if fts_cleaned > 0 {
+                tracing::info!("Cleaned up {} orphaned FTS entries.", fts_cleaned);
+            }
+        }
+    }
+
     // ── Phase 1: Read all files, collect those needing (re-)indexing ───
     // Cache all content to avoid re-reading during import analysis (Phase 5).
     let mut to_index: Vec<PendingFile> = Vec::new();
