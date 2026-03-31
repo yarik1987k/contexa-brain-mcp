@@ -23,9 +23,26 @@ fn get_model() -> Result<&'static Mutex<TextEmbedding>> {
 }
 
 /// Generate an embedding vector for a single text.
+/// Recovers from mutex poison (prior panic) by clearing the poison.
 pub fn embed_text(text: &str) -> Result<Vec<f32>> {
-    let model = get_model()?;
-    let model = model.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+    // Cap input length to prevent OOM in the model
+    let text = if text.len() > 8192 {
+        &text[..8192]
+    } else {
+        text
+    };
+
+    let mutex = get_model()?;
+    // Recover from poison: if a prior call panicked, the mutex is poisoned
+    // but the inner data is still valid (TextEmbedding doesn't have invariants
+    // that a panic could violate). Use into_inner() on the poison error.
+    let model = match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("[context-brain] WARNING: Embedding mutex was poisoned, recovering...");
+            poisoned.into_inner()
+        }
+    };
     let embeddings = model.embed(vec![text], None)?;
     embeddings
         .into_iter()
@@ -34,10 +51,23 @@ pub fn embed_text(text: &str) -> Result<Vec<f32>> {
 }
 
 /// Generate embeddings for a batch of texts.
+/// More efficient than calling embed_text in a loop.
 pub fn embed_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-    let model = get_model()?;
-    let model = model.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-    let embeddings = model.embed(texts.to_vec(), None)?;
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Cap each input
+    let capped: Vec<&str> = texts.iter().map(|t| {
+        if t.len() > 8192 { &t[..8192] } else { t }
+    }).collect();
+
+    let mutex = get_model()?;
+    let model = match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let embeddings = model.embed(capped, None)?;
     Ok(embeddings)
 }
 
@@ -58,7 +88,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
+    if denom < f32::EPSILON {
         0.0
     } else {
         dot / denom
@@ -67,3 +97,21 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Embedding dimension for the current model (AllMiniLML6V2 = 384).
 pub const EMBEDDING_DIM: usize = 384;
+
+// ── TurboQuant integration ──────────────────────────────────────────
+
+use crate::turboquant::{TurboQuant, QuantMode, QuantizedVector};
+
+/// Global TurboQuant engine — initialized once for the model dimension.
+static TURBOQUANT: std::sync::LazyLock<TurboQuant> =
+    std::sync::LazyLock::new(|| TurboQuant::new(EMBEDDING_DIM));
+
+/// Get a reference to the global TurboQuant engine.
+pub fn get_turboquant() -> &'static TurboQuant {
+    &TURBOQUANT
+}
+
+/// Quantize an embedding using TurboQuant (2-bit, fast mode).
+pub fn quantize_embedding(embedding: &[f32]) -> QuantizedVector {
+    TURBOQUANT.quantize(embedding, 2, QuantMode::Fast)
+}

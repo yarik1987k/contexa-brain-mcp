@@ -3,8 +3,8 @@ mod tools;
 mod indexer;
 mod memory;
 mod context;
-mod turboquant;
 mod db;
+mod turboquant;
 
 use anyhow::Result;
 use clap::Parser;
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
         }
         Commands::Summary { file, mode } => {
             let path = std::fs::canonicalize(&file)?;
-            let result = tools::get_file_context::read_file_context(&path, &mode, 3000)?;
+            let result = tools::get_file_context::read_file_context(&path, &mode, 3000, None)?;
             print!("{}", result);
         }
         Commands::Search { query, project, max_results } => {
@@ -156,9 +156,18 @@ async fn main() -> Result<()> {
             depth,
         } => {
             let project_path = std::fs::canonicalize(&project)?;
-            let base = path
-                .map(|p| project_path.join(p))
-                .unwrap_or(project_path);
+            let base = match path {
+                Some(p) => {
+                    let joined = project_path.join(&p);
+                    let resolved = std::fs::canonicalize(&joined)
+                        .unwrap_or(joined);
+                    if !resolved.starts_with(&project_path) {
+                        anyhow::bail!("Path escapes project directory");
+                    }
+                    resolved
+                }
+                None => project_path,
+            };
             let tree = tools::list_files::build_file_tree(&base, depth)?;
             print!("{}", tree);
         }

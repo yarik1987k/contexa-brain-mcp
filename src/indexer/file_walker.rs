@@ -23,12 +23,7 @@ pub fn walk_project(project_path: &Path) -> Result<Vec<FileEntry>> {
         .git_exclude(true)      // respect .git/info/exclude
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            // Skip common non-source directories even if not in .gitignore
-            !matches!(
-                name.as_ref(),
-                "node_modules" | ".git" | ".next" | "dist" | "build" | "target"
-                | "coverage" | "__pycache__" | ".venv" | "venv" | ".DS_Store"
-            )
+            !super::config::is_skip_dir(&name)
         })
         .build();
 
@@ -51,7 +46,7 @@ pub fn walk_project(project_path: &Path) -> Result<Vec<FileEntry>> {
             .to_string();
 
         // Only include source code files
-        if !is_source_file(&ext) {
+        if !super::config::is_source_file(&ext) {
             continue;
         }
 
@@ -76,25 +71,3 @@ pub fn walk_project(project_path: &Path) -> Result<Vec<FileEntry>> {
     Ok(files)
 }
 
-fn is_source_file(ext: &str) -> bool {
-    matches!(
-        ext,
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
-        | "py" | "pyi"
-        | "rs"
-        | "go"
-        | "java" | "kt" | "scala"
-        | "rb"
-        | "php"
-        | "c" | "cpp" | "cc" | "h" | "hpp"
-        | "cs"
-        | "swift"
-        | "json" | "yaml" | "yml" | "toml"
-        | "md" | "txt"
-        | "css" | "scss" | "less"
-        | "html" | "vue" | "svelte"
-        | "sql"
-        | "sh" | "bash" | "zsh"
-        | "dockerfile"
-    )
-}

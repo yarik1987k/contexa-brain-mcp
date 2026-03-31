@@ -90,23 +90,14 @@ fn is_source_file(path: &Path) -> bool {
     // Skip hidden files / directories and common non-source paths
     for component in path.components() {
         let s = component.as_os_str().to_string_lossy();
-        if s.starts_with('.') || s == "node_modules" || s == "target" || s == "__pycache__" {
+        if s.starts_with('.') || super::config::is_skip_dir(&s) {
             return false;
         }
     }
 
-    let source_exts = [
-        "js", "jsx", "mjs", "cjs",
-        "ts", "tsx",
-        "py", "pyi",
-        "rs",
-        "go",
-        "c", "h", "cpp", "cc", "cxx", "hpp", "hxx",
-    ];
-
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|ext| source_exts.contains(&ext))
+        .map(|ext| super::config::is_source_file(ext))
         .unwrap_or(false)
 }
 

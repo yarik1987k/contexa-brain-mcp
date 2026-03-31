@@ -6,6 +6,7 @@ use crate::db::schema;
 use crate::indexer::embedding_client;
 
 /// Recall memories using semantic search + keyword search + recency.
+/// Prefers TurboQuant compressed embeddings for faster similarity (falls back to raw f32).
 pub fn recall(
     project_path: &Path,
     query: &str,
@@ -23,35 +24,53 @@ pub fn recall(
     // Generate query embedding for semantic search
     let query_embedding = embedding_client::embed_text(query).ok();
 
-    // Load all memories with embeddings
-    let stmt = if let Some(cat) = category {
+    // Prepare TurboQuant query vector once (reused for all compressed comparisons)
+    let tq = embedding_client::get_turboquant();
+    let query_prepared = query_embedding.as_ref().map(|qe| {
+        let (rotated, norm) = tq.prepare_query(qe);
+        (qe, rotated, norm)
+    });
+
+    // Load memories
+    let memories = if let Some(cat) = category {
         let mut s = conn.prepare(
-            "SELECT id, content, category, tags, created_at, embedding FROM memories WHERE category = ?1 ORDER BY created_at DESC LIMIT 100",
+            "SELECT id, content, category, tags, created_at, embedding, embedding_compressed
+             FROM memories WHERE category = ?1 ORDER BY created_at DESC LIMIT 100",
         )?;
-        let rows = collect_memories(&mut s, Some(cat))?;
-        rows
+        collect_memories(&mut s, Some(cat))?
     } else {
         let mut s = conn.prepare(
-            "SELECT id, content, category, tags, created_at, embedding FROM memories ORDER BY created_at DESC LIMIT 100",
+            "SELECT id, content, category, tags, created_at, embedding, embedding_compressed
+             FROM memories ORDER BY created_at DESC LIMIT 100",
         )?;
-        let rows = collect_memories_all(&mut s)?;
-        rows
+        collect_memories(&mut s, None)?
     };
 
-    if stmt.is_empty() {
+    if memories.is_empty() {
         return Ok("No memories stored yet.".to_string());
     }
 
     // Score each memory
-    let mut scored: Vec<(f32, &MemoryRow)> = stmt
+    let total = memories.len() as f32;
+    let mut scored: Vec<(f32, &MemoryRow)> = memories
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(i, row)| {
             let mut score: f32 = 0.0;
 
-            // Semantic similarity (0.7 weight)
-            if let (Some(ref qe), Some(ref me)) = (&query_embedding, &row.embedding) {
-                let sim = embedding_client::cosine_similarity(qe, me);
-                score += sim * 0.7;
+            // Semantic similarity (0.7 weight) — prefer compressed, fall back to raw
+            if let Some((qe, ref rotated, norm)) = query_prepared {
+                if let Some(ref blob) = row.embedding_compressed {
+                    // Fast path: TurboQuant compressed similarity
+                    if let Some(qv) = schema::blob_to_quantized(blob) {
+                        let sim = tq.fast_cosine_similarity(rotated, norm, &qv);
+                        score += sim * 0.7;
+                    }
+                } else if let Some(ref me) = row.embedding {
+                    // Fallback: raw f32 cosine similarity
+                    let sim = embedding_client::cosine_similarity(qe, me);
+                    score += sim * 0.7;
+                }
             }
 
             // Keyword match (0.2 weight)
@@ -69,8 +88,8 @@ pub fn recall(
             }
 
             // Recency bonus (0.1 weight) — newer memories score higher
-            // Simple: first in list = most recent = highest bonus
-            score += 0.1;
+            // Index 0 = most recent (ORDER BY created_at DESC), decays linearly
+            score += 0.1 * (1.0 - i as f32 / total.max(1.0));
 
             (score, row)
         })
@@ -112,35 +131,30 @@ struct MemoryRow {
     tags: String,
     created_at: String,
     embedding: Option<Vec<f32>>,
+    embedding_compressed: Option<Vec<u8>>,
+}
+
+fn map_memory_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
+    let embedding_blob: Option<Vec<u8>> = row.get(5)?;
+    let compressed_blob: Option<Vec<u8>> = row.get(6)?;
+    Ok(MemoryRow {
+        content: row.get(1)?,
+        category: row.get(2)?,
+        tags: row.get(3)?,
+        created_at: row.get(4)?,
+        embedding: embedding_blob.map(|b| schema::blob_to_embedding(&b)),
+        embedding_compressed: compressed_blob,
+    })
 }
 
 fn collect_memories(
     stmt: &mut rusqlite::Statement,
     category: Option<&str>,
 ) -> Result<Vec<MemoryRow>> {
-    let rows = stmt.query_map(rusqlite::params![category.unwrap_or("")], |row| {
-        let embedding_blob: Option<Vec<u8>> = row.get(5)?;
-        Ok(MemoryRow {
-            content: row.get(1)?,
-            category: row.get(2)?,
-            tags: row.get(3)?,
-            created_at: row.get(4)?,
-            embedding: embedding_blob.map(|b| schema::blob_to_embedding(&b)),
-        })
-    })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
-}
-
-fn collect_memories_all(stmt: &mut rusqlite::Statement) -> Result<Vec<MemoryRow>> {
-    let rows = stmt.query_map([], |row| {
-        let embedding_blob: Option<Vec<u8>> = row.get(5)?;
-        Ok(MemoryRow {
-            content: row.get(1)?,
-            category: row.get(2)?,
-            tags: row.get(3)?,
-            created_at: row.get(4)?,
-            embedding: embedding_blob.map(|b| schema::blob_to_embedding(&b)),
-        })
-    })?;
+    let rows = if let Some(cat) = category {
+        stmt.query_map(rusqlite::params![cat], map_memory_row)?
+    } else {
+        stmt.query_map([], map_memory_row)?
+    };
     Ok(rows.filter_map(|r| r.ok()).collect())
 }

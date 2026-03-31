@@ -28,10 +28,12 @@ pub struct ListFilesParams {
 pub struct GetFileContextParams {
     #[schemars(description = "Relative file path from project root")]
     pub path: String,
-    #[schemars(description = "Reading mode: 'full', 'summary', or 'symbols' (default: summary)")]
+    #[schemars(description = "Reading mode: 'full', 'summary', 'smart', or 'symbols' (default: summary). 'smart' mode uses the query to include full code for relevant functions and only signatures for the rest.")]
     pub mode: Option<String>,
     #[schemars(description = "Max tokens to return (default: 3000)")]
     pub token_budget: Option<u32>,
+    #[schemars(description = "Optional query/context for smart mode — helps select which functions to show in full")]
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -91,7 +93,11 @@ impl ContextBrainServer {
     pub fn new(project_path: PathBuf) -> Self {
         // Auto-index on startup if not already indexed
         if !indexer::pipeline::is_indexed(&project_path) {
-            eprintln!("[context-brain] Project not indexed. Run `context-brain index` for faster searches.");
+            eprintln!("[context-brain] Project not indexed. Auto-indexing...");
+            match indexer::pipeline::index_project(&project_path) {
+                Ok(stats) => eprintln!("[context-brain] {}", stats),
+                Err(e) => eprintln!("[context-brain] Auto-index failed (search will use live scan): {}", e),
+            }
         }
 
         Self {
@@ -106,7 +112,16 @@ impl ContextBrainServer {
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, McpError> {
         let base = match &params.path {
-            Some(p) => self.project_path.join(p),
+            Some(p) => {
+                let joined = self.project_path.join(p);
+                let resolved = joined.canonicalize().map_err(|e|
+                    McpError::internal_error(format!("Invalid path: {}", e), None))?;
+                if !resolved.starts_with(&self.project_path) {
+                    return Err(McpError::internal_error(
+                        "Path escapes project directory".to_string(), None));
+                }
+                resolved
+            }
             None => self.project_path.clone(),
         };
         let max_depth = params.depth.unwrap_or(2);
@@ -117,7 +132,7 @@ impl ContextBrainServer {
         Ok(CallToolResult::success(vec![Content::text(tree)]))
     }
 
-    #[tool(description = "Read a file with smart token optimization. Modes: 'full' (entire file), 'summary' (imports + AST-parsed signatures), 'symbols' (AST symbol list with line numbers).")]
+    #[tool(description = "Read a file with smart token optimization. Modes: 'full' (entire file), 'summary' (imports + AST signatures), 'smart' (query-aware: full code for relevant functions, signatures for rest — best for targeted work), 'symbols' (compact symbol list). Use 'smart' with a query for maximum token savings.")]
     async fn get_file_context(
         &self,
         Parameters(params): Parameters<GetFileContextParams>,
@@ -138,11 +153,24 @@ impl ContextBrainServer {
             }
         };
         let file_path = self.project_path.join(&relative);
+        // Path containment: ensure resolved path stays within project
+        let resolved = file_path.canonicalize().map_err(|e|
+            McpError::internal_error(format!("Invalid path: {}", e), None))?;
+        if !resolved.starts_with(&self.project_path) {
+            return Err(McpError::internal_error(
+                "Path escapes project directory".to_string(), None));
+        }
+        let file_path = resolved;
         let mode = params.mode.unwrap_or_else(|| "summary".to_string());
-        let budget = params.token_budget.unwrap_or(3000);
+        let budget = params.token_budget.unwrap_or(3000).min(100_000);
 
-        let result = tools::get_file_context::read_file_context(&file_path, &mode, budget)
-            .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
+        let result = tools::get_file_context::read_file_context(
+            &file_path,
+            &mode,
+            budget,
+            params.query.as_deref(),
+        )
+        .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }

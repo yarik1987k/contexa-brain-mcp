@@ -44,11 +44,7 @@ pub fn build_overview(project_path: &Path) -> Result<String> {
         .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
         .filter(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            !matches!(
-                name.as_str(),
-                "node_modules" | ".git" | ".next" | "dist" | "build" | "target"
-                | "coverage" | "__pycache__" | ".venv" | "venv"
-            )
+            !crate::indexer::config::is_skip_dir(&name)
         })
         .collect();
 
@@ -84,11 +80,7 @@ fn count_files_recursive(dir: &Path, counts: &mut std::collections::HashMap<Stri
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if matches!(
-            name.as_str(),
-            "node_modules" | ".git" | ".next" | "dist" | "build" | "target"
-            | "coverage" | "__pycache__" | ".venv"
-        ) {
+        if crate::indexer::config::is_skip_dir(&name) {
             continue;
         }
 
