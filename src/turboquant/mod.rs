@@ -4,10 +4,8 @@ pub mod qjl;
 
 use rotation::{generate_sign_flips, apply_rotation, apply_inverse_rotation};
 use codebooks::{build_codebooks, quantize_vector, dequantize_vector, pack_indices, unpack_indices, Codebook};
-use qjl::{qjl_project, qjl_inner_product};
+use qjl::qjl_project;
 
-const DEFAULT_DIMENSION: usize = 1024;
-const DEFAULT_BITS: u8 = 2;
 const ROTATION_SEED: &str = "contexa-turbo-v1";
 const QJL_SEED: &str = "contexa-qjl-v1";
 
@@ -49,13 +47,9 @@ impl TurboQuant {
         }
     }
 
-    /// Create with default dimension (1024).
-    pub fn default() -> Self {
-        Self::new(DEFAULT_DIMENSION)
-    }
-
-    /// Quantize a vector.
+    /// Quantize a vector. `bits` must be 1-4.
     pub fn quantize(&self, vector: &[f32], bits: u8, mode: QuantMode) -> QuantizedVector {
+        assert!((1..=4).contains(&bits), "bits must be 1-4, got {}", bits);
         let d = vector.len();
         let padded_dim = self.padded_dim;
 
@@ -79,15 +73,14 @@ impl TurboQuant {
             };
         }
 
-        // Normalize to unit sphere
-        let mut unit = vec![0.0f32; padded_dim];
+        // Normalize to unit sphere (in-place, reuse vec)
         for i in 0..padded_dim {
-            unit[i] = vec[i] / norm;
+            vec[i] /= norm;
         }
 
-        // Apply random rotation
-        let mut rotated = unit.clone();
-        apply_rotation(&mut rotated, &self.sign_flips);
+        // Apply random rotation (in-place)
+        apply_rotation(&mut vec, &self.sign_flips);
+        let rotated = &vec;
 
         // Determine MSE bit-width
         let mse_bits = if mode == QuantMode::Unbiased {
@@ -98,7 +91,8 @@ impl TurboQuant {
         let codebook = &self.codebooks[(mse_bits - 1) as usize];
 
         let indices = quantize_vector(&rotated, codebook);
-        let packed = pack_indices(&indices, mse_bits);
+        let packed = pack_indices(&indices, mse_bits)
+            .expect("Internal error: invalid mse_bits in quantize");
 
         if mode == QuantMode::Fast {
             return QuantizedVector {
@@ -116,12 +110,11 @@ impl TurboQuant {
         // Unbiased mode: compute residual and apply QJL
         let dequantized = dequantize_vector(&indices, codebook);
 
-        let mut residual_rotated = vec![0.0f32; padded_dim];
+        let mut residual = vec![0.0f32; padded_dim];
         for i in 0..padded_dim {
-            residual_rotated[i] = rotated[i] - dequantized[i];
+            residual[i] = rotated[i] - dequantized[i];
         }
 
-        let mut residual = residual_rotated.clone();
         apply_inverse_rotation(&mut residual, &self.sign_flips);
         let residual_norm = l2_norm(&residual);
 
@@ -148,6 +141,7 @@ impl TurboQuant {
     }
 
     /// Dequantize back to approximate float vector.
+    #[allow(dead_code)]
     pub fn dequantize(&self, quantized: &QuantizedVector) -> Vec<f32> {
         if quantized.norm == 0.0 {
             return vec![0.0; quantized.original_dim];
@@ -160,7 +154,8 @@ impl TurboQuant {
         };
         let codebook = &self.codebooks[(mse_bits - 1) as usize];
 
-        let indices = unpack_indices(&quantized.mse_indices, mse_bits, self.padded_dim);
+        let indices = unpack_indices(&quantized.mse_indices, mse_bits, self.padded_dim)
+            .expect("Internal error: invalid mse_bits in dequantize");
         let mut rotated_approx = dequantize_vector(&indices, codebook);
 
         apply_inverse_rotation(&mut rotated_approx, &self.sign_flips);
@@ -190,7 +185,10 @@ impl TurboQuant {
         };
         let codebook = &self.codebooks[(mse_bits - 1) as usize];
         let d = query_rotated.len();
-        let indices = unpack_indices(&quantized.mse_indices, mse_bits, d);
+        let indices = match unpack_indices(&quantized.mse_indices, mse_bits, d) {
+            Ok(i) => i,
+            Err(_) => return 0.0,
+        };
 
         let mut dot = 0.0f32;
         for i in 0..d {
@@ -198,61 +196,6 @@ impl TurboQuant {
         }
 
         (dot * quantized.norm) / (query_norm * quantized.norm)
-    }
-
-    /// Full cosine similarity with QJL correction (unbiased).
-    pub fn cosine_similarity(&self, query: &[f32], quantized: &QuantizedVector) -> f32 {
-        let d = query.len();
-        let padded_dim = self.padded_dim;
-
-        if quantized.norm == 0.0 {
-            return 0.0;
-        }
-
-        // Pad query
-        let mut q = vec![0.0f32; padded_dim];
-        for i in 0..d.min(padded_dim) {
-            q[i] = query[i];
-        }
-        let query_norm = l2_norm(&q);
-        if query_norm == 0.0 {
-            return 0.0;
-        }
-
-        // Rotate query
-        let mut query_rotated = q.clone();
-        apply_rotation(&mut query_rotated, &self.sign_flips);
-
-        // MSE component
-        let mse_bits = if quantized.mode == QuantMode::Unbiased {
-            (quantized.bits - 1).max(1)
-        } else {
-            quantized.bits
-        };
-        let codebook = &self.codebooks[(mse_bits - 1) as usize];
-        let indices = unpack_indices(&quantized.mse_indices, mse_bits, d);
-
-        let mut mse_dot = 0.0f32;
-        for i in 0..d {
-            mse_dot += query_rotated[i] * codebook.centroids[indices[i] as usize];
-        }
-        mse_dot *= quantized.norm;
-
-        // QJL correction
-        let mut qjl_dot = 0.0f32;
-        if quantized.residual_norm > 1e-10 {
-            if let Some(ref qjl_bits) = quantized.qjl_bits {
-                qjl_dot = qjl_inner_product(
-                    qjl_bits,
-                    quantized.residual_norm * quantized.norm,
-                    &q,
-                    QJL_SEED,
-                    d,
-                );
-            }
-        }
-
-        (mse_dot + qjl_dot) / (query_norm * quantized.norm)
     }
 
     /// Prepare a rotated query for batch fast_cosine_similarity calls.
@@ -268,6 +211,7 @@ impl TurboQuant {
     }
 
     /// Get compression statistics.
+    #[allow(dead_code)]
     pub fn storage_info(&self, bits: u8, d: usize) -> StorageInfo {
         let mse_bits = (bits - 1).max(1);
         let mse_bytes = (d * mse_bits as usize + 7) / 8;
@@ -285,6 +229,7 @@ impl TurboQuant {
     }
 }
 
+#[allow(dead_code)]
 pub struct StorageInfo {
     pub mse_bytes: usize,
     pub qjl_bytes: usize,

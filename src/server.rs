@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rmcp::{
     ServerHandler,
@@ -86,6 +87,7 @@ pub struct IndexProjectParams {
 pub struct ContextBrainServer {
     project_path: PathBuf,
     tool_router: ToolRouter<Self>,
+    _watcher: Option<Arc<indexer::watch_manager::WatchManager>>,
 }
 
 #[tool_router]
@@ -93,16 +95,29 @@ impl ContextBrainServer {
     pub fn new(project_path: PathBuf) -> Self {
         // Auto-index on startup if not already indexed
         if !indexer::pipeline::is_indexed(&project_path) {
-            eprintln!("[context-brain] Project not indexed. Auto-indexing...");
+            tracing::info!("Project not indexed. Auto-indexing...");
             match indexer::pipeline::index_project(&project_path) {
-                Ok(stats) => eprintln!("[context-brain] {}", stats),
-                Err(e) => eprintln!("[context-brain] Auto-index failed (search will use live scan): {}", e),
+                Ok(stats) => tracing::info!("{}", stats),
+                Err(e) => tracing::warn!("Auto-index failed (search will use live scan): {}", e),
             }
         }
+
+        // Start file watcher for incremental re-indexing
+        let watcher = match indexer::watch_manager::WatchManager::start(project_path.clone()) {
+            Ok(wm) => {
+                tracing::info!("File watcher started");
+                Some(Arc::new(wm))
+            }
+            Err(e) => {
+                tracing::warn!("File watcher failed to start: {}", e);
+                None
+            }
+        };
 
         Self {
             project_path,
             tool_router: Self::tool_router(),
+            _watcher: watcher,
         }
     }
 
@@ -111,25 +126,26 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let base = match &params.path {
-            Some(p) => {
-                let joined = self.project_path.join(p);
-                let resolved = joined.canonicalize().map_err(|e|
-                    McpError::internal_error(format!("Invalid path: {}", e), None))?;
-                if !resolved.starts_with(&self.project_path) {
-                    return Err(McpError::internal_error(
-                        "Path escapes project directory".to_string(), None));
+        let project_path = self.project_path.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let base = match &params.path {
+                Some(p) => {
+                    let joined = project_path.join(p);
+                    let resolved = joined.canonicalize().map_err(|e| format!("Invalid path: {}", e))?;
+                    if !resolved.starts_with(&project_path) {
+                        return Err("Path escapes project directory".to_string());
+                    }
+                    resolved
                 }
-                resolved
-            }
-            None => self.project_path.clone(),
-        };
-        let max_depth = params.depth.unwrap_or(2);
+                None => project_path.clone(),
+            };
+            let max_depth = params.depth.unwrap_or(2);
+            tools::list_files::build_file_tree(&base, max_depth)
+                .map_err(|e| format!("Failed to list files: {}", e))
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(e, None))?;
 
-        let tree = tools::list_files::build_file_tree(&base, max_depth)
-            .map_err(|e| McpError::internal_error(format!("Failed to list files: {}", e), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(tree)]))
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     #[tool(description = "Read a file with smart token optimization. Modes: 'full' (entire file), 'summary' (imports + AST signatures), 'smart' (query-aware: full code for relevant functions, signatures for rest — best for targeted work), 'symbols' (compact symbol list). Use 'smart' with a query for maximum token savings.")]
@@ -137,40 +153,34 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<GetFileContextParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Fix path duplication: if Claude passes "project-name/src/foo.js" but the project root is
-        // already "/path/to/project-name", strip the leading directory component to avoid
-        // resolving to "/path/to/project-name/project-name/src/foo.js".
-        let relative = {
-            let p = std::path::Path::new(&params.path);
-            if let Some(project_dir_name) = self.project_path.file_name() {
-                if let Ok(stripped) = p.strip_prefix(project_dir_name) {
-                    stripped.to_path_buf()
+        let project_path = self.project_path.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            // Fix path duplication: if Claude passes "project-name/src/foo.js" but the project root is
+            // already "/path/to/project-name", strip the leading directory component to avoid
+            // resolving to "/path/to/project-name/project-name/src/foo.js".
+            let relative = {
+                let p = std::path::Path::new(&params.path);
+                if let Some(project_dir_name) = project_path.file_name() {
+                    if let Ok(stripped) = p.strip_prefix(project_dir_name) {
+                        stripped.to_path_buf()
+                    } else {
+                        p.to_path_buf()
+                    }
                 } else {
                     p.to_path_buf()
                 }
-            } else {
-                p.to_path_buf()
+            };
+            let file_path = project_path.join(&relative);
+            let resolved = file_path.canonicalize().map_err(|e| format!("Invalid path: {}", e))?;
+            if !resolved.starts_with(&project_path) {
+                return Err("Path escapes project directory".to_string());
             }
-        };
-        let file_path = self.project_path.join(&relative);
-        // Path containment: ensure resolved path stays within project
-        let resolved = file_path.canonicalize().map_err(|e|
-            McpError::internal_error(format!("Invalid path: {}", e), None))?;
-        if !resolved.starts_with(&self.project_path) {
-            return Err(McpError::internal_error(
-                "Path escapes project directory".to_string(), None));
-        }
-        let file_path = resolved;
-        let mode = params.mode.unwrap_or_else(|| "summary".to_string());
-        let budget = params.token_budget.unwrap_or(3000).min(100_000);
-
-        let result = tools::get_file_context::read_file_context(
-            &file_path,
-            &mode,
-            budget,
-            params.query.as_deref(),
-        )
-        .map_err(|e| McpError::internal_error(format!("Failed to read file: {}", e), None))?;
+            let mode = params.mode.unwrap_or_else(|| "summary".to_string());
+            let budget = params.token_budget.unwrap_or(3000).min(100_000);
+            tools::get_file_context::read_file_context(&resolved, &mode, budget, params.query.as_deref())
+                .map_err(|e| format!("Failed to read file: {}", e))
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(e, None))?;
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
@@ -180,12 +190,11 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<CallToolResult, McpError> {
-        let result = tools::get_symbol::get_symbol(
-            &self.project_path,
-            &params.name,
-            params.file.as_deref(),
-        )
-        .map_err(|e| McpError::internal_error(format!("Failed to get symbol: {}", e), None))?;
+        let project_path = self.project_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            tools::get_symbol::get_symbol(&project_path, &params.name, params.file.as_deref())
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(format!("Failed to get symbol: {}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
@@ -195,13 +204,15 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<SearchCodebaseParams>,
     ) -> Result<CallToolResult, McpError> {
-        let max = params.max_results.unwrap_or(10);
-        let budget = params.token_budget.unwrap_or(4000);
+        let project_path = self.project_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let max = params.max_results.unwrap_or(10);
+            let budget = params.token_budget.unwrap_or(4000);
+            tools::search_codebase::search(&project_path, &params.query, max, budget)
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(format!("Search failed: {}", e), None))?;
 
-        let results = tools::search_codebase::search(&self.project_path, &params.query, max, budget)
-            .map_err(|e| McpError::internal_error(format!("Search failed: {}", e), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(results)]))
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     #[tool(description = "Save a decision, architectural insight, or task context to persistent memory. This memory persists across Cursor sessions and is searchable semantically.")]
@@ -209,11 +220,13 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cat = params.category.unwrap_or_else(|| "general".to_string());
-        let tags = params.tags.unwrap_or_default();
-
-        memory::store::save(&self.project_path, &params.content, &cat, &tags)
-            .map_err(|e| McpError::internal_error(format!("Failed to save memory: {}", e), None))?;
+        let project_path = self.project_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let cat = params.category.unwrap_or_else(|| "general".to_string());
+            let tags = params.tags.unwrap_or_default();
+            memory::store::save(&project_path, &params.content, &cat, &tags)
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(format!("Failed to save memory: {}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text("Memory saved successfully.")]))
     }
@@ -223,20 +236,25 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<RecallMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        let max = params.max_results.unwrap_or(5);
+        let project_path = self.project_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let max = params.max_results.unwrap_or(5);
+            memory::searcher::recall(&project_path, &params.query, params.category.as_deref(), max)
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(format!("Failed to recall: {}", e), None))?;
 
-        let results = memory::searcher::recall(&self.project_path, &params.query, params.category.as_deref(), max)
-            .map_err(|e| McpError::internal_error(format!("Failed to recall: {}", e), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(results)]))
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     #[tool(description = "Get a condensed project architecture overview (~500 tokens). Reads README/ARCHITECTURE.md plus dynamic file stats and tech stack detection.")]
     async fn get_architecture(&self) -> Result<CallToolResult, McpError> {
-        let overview = tools::get_architecture::build_overview(&self.project_path)
-            .map_err(|e| McpError::internal_error(format!("Failed to build overview: {}", e), None))?;
+        let project_path = self.project_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            tools::get_architecture::build_overview(&project_path)
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(format!("Failed to build overview: {}", e), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(overview)]))
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     #[tool(description = "Index the project codebase: extract symbols via AST, generate embeddings for semantic search, and store in local database. Run this once for fast future searches.")]
@@ -244,21 +262,19 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<IndexProjectParams>,
     ) -> Result<CallToolResult, McpError> {
-        let force = params.force.unwrap_or(false);
+        let project_path = self.project_path.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let force = params.force.unwrap_or(false);
+            if !force && indexer::pipeline::is_indexed(&project_path) {
+                return Ok("Project already indexed. Use force=true to re-index.".to_string());
+            }
+            let stats = indexer::pipeline::index_project(&project_path)
+                .map_err(|e| format!("Indexing failed: {}", e))?;
+            Ok(format!("Indexing complete! {}", stats))
+        }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
+          .map_err(|e| McpError::internal_error(e, None))?;
 
-        if !force && indexer::pipeline::is_indexed(&self.project_path) {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Project already indexed. Use force=true to re-index.",
-            )]));
-        }
-
-        let stats = indexer::pipeline::index_project(&self.project_path)
-            .map_err(|e| McpError::internal_error(format!("Indexing failed: {}", e), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Indexing complete! {}",
-            stats
-        ))]))
+        Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 }
 

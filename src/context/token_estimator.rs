@@ -50,13 +50,14 @@ pub fn estimate_tokens(text: &str) -> usize {
 
 /// Convert a token budget to an approximate character budget.
 /// Inverse of estimate_tokens — conservative (allows slightly more chars than tokens would use).
+/// Based on estimate_tokens heuristic: code averages ~3-4 chars/token.
+/// Uses 4.0 as a conservative inverse to avoid over-truncating.
 pub fn tokens_to_chars(token_budget: u32) -> usize {
-    // Based on estimate_tokens heuristic: code averages ~3.2 chars/token
-    // Use 3.5 as a conservative inverse to avoid over-truncating
-    ((token_budget as f64) * 3.5) as usize
+    ((token_budget as f64) * 4.0) as usize
 }
 
 /// Check if content fits within a token budget.
+#[allow(dead_code)]
 pub fn fits_budget(text: &str, budget: u32) -> bool {
     estimate_tokens(text) <= budget as usize
 }

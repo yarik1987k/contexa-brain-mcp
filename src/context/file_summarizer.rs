@@ -2,8 +2,7 @@ use std::fmt::Write;
 use std::path::Path;
 use anyhow::Result;
 
-use crate::context::token_estimator;
-use crate::context::relevance_scorer;
+use crate::context::{token_estimator, relevance_scorer, scoring};
 use crate::indexer::symbol_extractor::{self, Symbol};
 use crate::indexer::embedding_client;
 
@@ -30,14 +29,7 @@ pub fn smart_summarize(
     writeln!(&mut output, "# {} ({} lines)\n", path.display(), line_count)?;
 
     // If no query or non-AST file, fall back to structural summary
-    let has_ast = matches!(
-        ext,
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
-        | "py" | "pyi"
-        | "rs"
-        | "go"
-        | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx"
-    );
+    let has_ast = crate::indexer::config::has_ast_support(ext);
 
     if !has_ast || query.is_none() {
         return structural_summary(content, path, token_budget, ext, &mut output);
@@ -52,7 +44,7 @@ pub fn smart_summarize(
     };
 
     // Generate query embedding once
-    let query_embedding = embedding_client::embed_text(query).ok();
+    let query_embedding = embedding_client::try_embed_text(query);
 
     // Batch-score all symbols (single model call instead of N calls)
     let scores = relevance_scorer::score_symbols_batch(&symbols, query, query_embedding.as_deref());
@@ -64,7 +56,7 @@ pub fn smart_summarize(
         .collect();
 
     // Sort by relevance (highest first)
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| relevance_scorer::cmp_score_desc(a.0, b.0));
 
     // Always include imports (cheap, provides context)
     let imports = extract_imports(content, ext);
@@ -85,7 +77,7 @@ pub fn smart_summarize(
 
         let lines_span = sym.end_line.saturating_sub(sym.start_line) + 1;
 
-        if *score > 0.25 {
+        if *score > scoring::RELEVANCE_HIGH_THRESHOLD {
             // High relevance: include full code body
             let code_tokens = token_estimator::estimate_tokens(&sym.code) as u32;
 
@@ -111,7 +103,7 @@ pub fn smart_summarize(
                     sig_count += 1;
                 }
             }
-        } else if *score > 0.05 {
+        } else if *score > scoring::RELEVANCE_MEDIUM_THRESHOLD {
             // Medium relevance: signature only
             let sig_line = format!(
                 "- [{}] **{}** (L{}-L{}, {} lines): `{}`",
@@ -155,12 +147,7 @@ fn structural_summary(
     }
 
     // Try AST symbols
-    let has_ast = matches!(
-        ext,
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
-        | "py" | "pyi" | "rs" | "go"
-        | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx"
-    );
+    let has_ast = crate::indexer::config::has_ast_support(ext);
 
     if has_ast {
         if let Ok(symbols) = symbol_extractor::extract_symbols(content, ext) {

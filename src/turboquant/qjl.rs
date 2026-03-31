@@ -27,6 +27,9 @@ fn projection_dot_product(seed: &str, row_index: usize, vector: &[f32]) -> f32 {
 
     let mut i = 0;
     while i < d {
+        // Map u32 [0, 2^32-1] to open interval (0, 1) for Box-Muller:
+        //   +1 shifts range to [1, 2^32], then /2^32+1 maps to (0, 1).
+        //   This avoids u1=0 which would cause ln(0)=-inf in Box-Muller.
         let u1 = (rng.next() as f32 + 1.0) / 4294967297.0;
         let u2 = (rng.next() as f32 + 1.0) / 4294967297.0;
         let (g1, g2) = box_muller(u1, u2);
@@ -55,30 +58,3 @@ pub fn qjl_project(residual: &[f32], seed: &str, m: usize) -> Vec<u8> {
     buf
 }
 
-/// Compute the QJL inner product estimate: <y, r>.
-///
-/// Formula: ||r|| * (π/2) / m * Σ (S_i · y) * sign(S_i · r)
-pub fn qjl_inner_product(
-    qjl_bits: &[u8],
-    residual_norm: f32,
-    query_vector: &[f32],
-    seed: &str,
-    m: usize,
-) -> f32 {
-    if residual_norm == 0.0 {
-        return 0.0;
-    }
-
-    let mut sum = 0.0f32;
-    for i in 0..m {
-        let sign: f32 = if ((qjl_bits[i >> 3] >> (i & 7)) & 1) != 0 {
-            1.0
-        } else {
-            -1.0
-        };
-        let dot = projection_dot_product(seed, i, query_vector);
-        sum += dot * sign;
-    }
-
-    residual_norm * (PI / 2.0) * sum / m as f32
-}

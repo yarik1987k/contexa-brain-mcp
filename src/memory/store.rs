@@ -34,8 +34,7 @@ pub fn save(project_path: &Path, content: &str, category: &str, tags: &str) -> R
 
     // Check memory count limit
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
-        .unwrap_or(0);
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
     if count >= MAX_MEMORIES {
         bail!(
             "Memory limit reached ({}/{}). Delete old memories before adding new ones.",
@@ -44,13 +43,7 @@ pub fn save(project_path: &Path, content: &str, category: &str, tags: &str) -> R
     }
 
     // Generate embedding for semantic recall
-    let embedding = match embedding_client::embed_text(content) {
-        Ok(e) => Some(e),
-        Err(err) => {
-            eprintln!("[context-brain] Warning: Failed to generate embedding for memory: {}", err);
-            None
-        }
-    };
+    let embedding = embedding_client::try_embed_text(content);
 
     // Compress embedding with TurboQuant for faster recall
     let embedding_compressed = embedding.as_ref().map(|e| {

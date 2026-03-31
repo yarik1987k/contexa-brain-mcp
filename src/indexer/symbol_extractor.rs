@@ -1,5 +1,13 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
 use tree_sitter::{Language, Parser, Node};
+
+// Thread-local parser cache: one parser per language, reused across calls.
+thread_local! {
+    static PARSER_CACHE: RefCell<HashMap<&'static str, Parser>> = RefCell::new(HashMap::new());
+}
 
 /// A symbol extracted from source code via AST parsing.
 #[derive(Debug, Clone)]
@@ -47,16 +55,101 @@ impl std::fmt::Display for SymbolKind {
     }
 }
 
+// ── Data-driven extraction rules ─────────────────────────────────────
+
+/// A rule mapping a tree-sitter node kind to a symbol kind and name field.
+struct ExtractionRule {
+    node_kind: &'static str,
+    symbol_kind: SymbolKind,
+    name_field: &'static str,
+}
+
+/// Rules for simple "match node kind → extract name field" patterns.
+const JS_RULES: &[ExtractionRule] = &[
+    ExtractionRule { node_kind: "function_declaration", symbol_kind: SymbolKind::Function, name_field: "name" },
+    ExtractionRule { node_kind: "class_declaration", symbol_kind: SymbolKind::Class, name_field: "name" },
+];
+
+const TS_EXTRA_RULES: &[ExtractionRule] = &[
+    ExtractionRule { node_kind: "interface_declaration", symbol_kind: SymbolKind::Interface, name_field: "name" },
+    ExtractionRule { node_kind: "type_alias_declaration", symbol_kind: SymbolKind::TypeAlias, name_field: "name" },
+    ExtractionRule { node_kind: "enum_declaration", symbol_kind: SymbolKind::Enum, name_field: "name" },
+];
+
+const PYTHON_RULES: &[ExtractionRule] = &[
+    ExtractionRule { node_kind: "function_definition", symbol_kind: SymbolKind::Function, name_field: "name" },
+    ExtractionRule { node_kind: "class_definition", symbol_kind: SymbolKind::Class, name_field: "name" },
+];
+
+const RUST_RULES: &[ExtractionRule] = &[
+    ExtractionRule { node_kind: "function_item", symbol_kind: SymbolKind::Function, name_field: "name" },
+    ExtractionRule { node_kind: "struct_item", symbol_kind: SymbolKind::Struct, name_field: "name" },
+    ExtractionRule { node_kind: "enum_item", symbol_kind: SymbolKind::Enum, name_field: "name" },
+    ExtractionRule { node_kind: "trait_item", symbol_kind: SymbolKind::Trait, name_field: "name" },
+    ExtractionRule { node_kind: "impl_item", symbol_kind: SymbolKind::Impl, name_field: "type" },
+];
+
+const GO_RULES: &[ExtractionRule] = &[
+    ExtractionRule { node_kind: "function_declaration", symbol_kind: SymbolKind::Function, name_field: "name" },
+    ExtractionRule { node_kind: "method_declaration", symbol_kind: SymbolKind::Method, name_field: "name" },
+];
+
+const C_RULES: &[ExtractionRule] = &[];
+
+/// Apply simple extraction rules to top-level children.
+fn extract_by_rules(node: &Node, source: &str, rules: &[ExtractionRule], symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        for rule in rules {
+            if child.kind() == rule.node_kind {
+                if let Some(name_node) = child.child_by_field_name(rule.name_field) {
+                    let name = node_text(&name_node, source);
+                    let mut kind = rule.symbol_kind.clone();
+                    // Detect async functions
+                    if kind == SymbolKind::Function && source[child.byte_range()].starts_with("async") {
+                        kind = SymbolKind::AsyncFunction;
+                    }
+                    push_symbol(symbols, name, kind, &child, source);
+                }
+            }
+        }
+    }
+}
+
+// ── Public API ───────────────────────────────────────────────────────
+
 /// Extract symbols from source code using tree-sitter.
+/// Parser is cached per language in thread-local storage to avoid re-allocation.
 pub fn extract_symbols(source: &str, extension: &str) -> Result<Vec<Symbol>> {
     let language = get_language(extension)?;
 
-    let mut parser = Parser::new();
-    parser.set_language(&language)?;
+    // Canonicalize extension to a stable key for the cache
+    let cache_key: &'static str = match extension {
+        "js" | "jsx" | "mjs" | "cjs" => "js",
+        "ts" => "ts",
+        "tsx" => "tsx",
+        "py" | "pyi" => "py",
+        "rs" => "rs",
+        "go" => "go",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
+        _ => return Err(anyhow::anyhow!("Unsupported language: .{}", extension)),
+    };
 
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse source"))?;
+    let tree = PARSER_CACHE.with({
+        let language = language.clone();
+        move |cache| -> Result<tree_sitter::Tree> {
+            let mut cache = cache.borrow_mut();
+            if !cache.contains_key(cache_key) {
+                let mut p = Parser::new();
+                p.set_language(&language)?;
+                cache.insert(cache_key, p);
+            }
+            let parser = cache.get_mut(cache_key).unwrap();
+            parser.parse(source, None)
+                .ok_or_else(|| anyhow::anyhow!("Failed to parse source"))
+        }
+    })?;
 
     let root = tree.root_node();
     let mut symbols = Vec::new();
@@ -89,52 +182,22 @@ fn get_language(extension: &str) -> Result<Language> {
     }
 }
 
-// ── JavaScript extraction ─────────────────────────────────────────────
+// ── JavaScript extraction ────────────────────────────────────────────
 
 fn extract_js_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
+    // Apply simple rules for function/class declarations
+    extract_by_rules(node, source, JS_RULES, symbols);
+
+    // Handle JS-specific patterns that need custom logic
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "function_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Function, &child, source);
-                }
-            }
-            "class_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Class, &child, source);
-                }
-            }
             "lexical_declaration" | "variable_declaration" => {
                 extract_variable_declarations(&child, source, symbols);
             }
             "export_statement" => {
-                // Recurse into exported declarations
-                let mut inner_cursor = child.walk();
-                for inner in child.children(&mut inner_cursor) {
-                    match inner.kind() {
-                        "function_declaration" => {
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                let name = node_text(&name_node, source);
-                                push_symbol(symbols, name, SymbolKind::Function, &child, source);
-                            }
-                        }
-                        "class_declaration" => {
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                let name = node_text(&name_node, source);
-                                push_symbol(symbols, name, SymbolKind::Class, &child, source);
-                            }
-                        }
-                        "lexical_declaration" | "variable_declaration" => {
-                            extract_variable_declarations(&inner, source, symbols);
-                        }
-                        _ => {}
-                    }
-                }
+                extract_export_contents(&child, source, symbols, JS_RULES);
             }
-            // CommonJS: module.exports = { ... } or exports.X = ...
             "expression_statement" => {
                 extract_commonjs_exports(&child, source, symbols);
             }
@@ -143,19 +206,36 @@ fn extract_js_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
     }
 }
 
+/// Extract exported declarations — applies rules inside export statements.
+fn extract_export_contents(node: &Node, source: &str, symbols: &mut Vec<Symbol>, rules: &[ExtractionRule]) {
+    let mut cursor = node.walk();
+    for inner in node.children(&mut cursor) {
+        // Try rule-based extraction first
+        for rule in rules {
+            if inner.kind() == rule.node_kind {
+                if let Some(name_node) = inner.child_by_field_name(rule.name_field) {
+                    let name = node_text(&name_node, source);
+                    push_symbol(symbols, name, rule.symbol_kind.clone(), node, source);
+                }
+            }
+        }
+        // Variable declarations in exports
+        if inner.kind() == "lexical_declaration" || inner.kind() == "variable_declaration" {
+            extract_variable_declarations(&inner, source, symbols);
+        }
+    }
+}
+
 /// Extract CommonJS module.exports = { ... } and exports.X = ... patterns
 fn extract_commonjs_exports(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
     let text = source[node.byte_range()].to_string();
 
-    // module.exports = { key1, key2, ... }
     if text.starts_with("module.exports") {
-        // Find the assignment_expression
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "assignment_expression" {
                 if let Some(right) = child.child_by_field_name("right") {
                     if right.kind() == "object" {
-                        // Extract each property name from the exports object
                         let mut obj_cursor = right.walk();
                         let mut export_names = Vec::new();
                         for prop in right.children(&mut obj_cursor) {
@@ -176,16 +256,13 @@ fn extract_commonjs_exports(node: &Node, source: &str, symbols: &mut Vec<Symbol>
                             push_symbol(symbols, name, SymbolKind::Export, node, source);
                         }
                     } else {
-                        // module.exports = someFunction or module.exports = class ...
                         let name = format!("module.exports = {}", node_text(&right, source).chars().take(60).collect::<String>());
                         push_symbol(symbols, name, SymbolKind::Export, node, source);
                     }
                 }
             }
         }
-    }
-    // exports.X = ...
-    else if text.starts_with("exports.") {
+    } else if text.starts_with("exports.") {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "assignment_expression" {
@@ -214,7 +291,6 @@ fn extract_variable_declarations(node: &Node, source: &str, symbols: &mut Vec<Sy
                         _ => SymbolKind::Constant,
                     };
                     let name = node_text(&name_node, source);
-                    // For functions/classes use the parent node span, for constants just the declarator
                     push_symbol(symbols, name, kind, node, source);
                 }
             }
@@ -222,180 +298,64 @@ fn extract_variable_declarations(node: &Node, source: &str, symbols: &mut Vec<Sy
     }
 }
 
-// ── TypeScript extraction (extends JS) ────────────────────────────────
+// ── TypeScript extraction (extends JS + TS-specific rules) ──────────
 
 fn extract_ts_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
     // TS is a superset of JS, start with JS extraction
     extract_js_symbols(node, source, symbols);
 
-    // Add TS-specific: interfaces, type aliases, enums
+    // Add TS-specific types using rules
+    extract_by_rules(node, source, TS_EXTRA_RULES, symbols);
+
+    // Handle TS-specific types inside export statements
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "interface_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Interface, &child, source);
-                }
-            }
-            "type_alias_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::TypeAlias, &child, source);
-                }
-            }
-            "enum_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Enum, &child, source);
-                }
-            }
-            "export_statement" => {
-                let mut inner_cursor = child.walk();
-                for inner in child.children(&mut inner_cursor) {
-                    match inner.kind() {
-                        "interface_declaration" => {
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                let name = node_text(&name_node, source);
-                                push_symbol(symbols, name, SymbolKind::Interface, &child, source);
-                            }
-                        }
-                        "type_alias_declaration" => {
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                let name = node_text(&name_node, source);
-                                push_symbol(symbols, name, SymbolKind::TypeAlias, &child, source);
-                            }
-                        }
-                        "enum_declaration" => {
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                let name = node_text(&name_node, source);
-                                push_symbol(symbols, name, SymbolKind::Enum, &child, source);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
+        if child.kind() == "export_statement" {
+            extract_export_contents(&child, source, symbols, TS_EXTRA_RULES);
         }
     }
 }
 
-// ── Python extraction ─────────────────────────────────────────────────
+// ── Python extraction ────────────────────────────────────────────────
 
 fn extract_python_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
+    extract_by_rules(node, source, PYTHON_RULES, symbols);
+
+    // Handle decorated definitions
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "function_definition" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    let kind = if source[child.byte_range()].starts_with("async") {
-                        SymbolKind::AsyncFunction
-                    } else {
-                        SymbolKind::Function
-                    };
-                    push_symbol(symbols, name, kind, &child, source);
-                }
-            }
-            "class_definition" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Class, &child, source);
-                }
-            }
-            "decorated_definition" => {
-                // Look inside for the actual definition
-                let mut inner_cursor = child.walk();
-                for inner in child.children(&mut inner_cursor) {
-                    match inner.kind() {
-                        "function_definition" => {
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                let name = node_text(&name_node, source);
-                                push_symbol(symbols, name, SymbolKind::Function, &child, source);
-                            }
+        if child.kind() == "decorated_definition" {
+            let mut inner_cursor = child.walk();
+            for inner in child.children(&mut inner_cursor) {
+                for rule in PYTHON_RULES {
+                    if inner.kind() == rule.node_kind {
+                        if let Some(name_node) = inner.child_by_field_name(rule.name_field) {
+                            let name = node_text(&name_node, source);
+                            push_symbol(symbols, name, rule.symbol_kind.clone(), &child, source);
                         }
-                        "class_definition" => {
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                let name = node_text(&name_node, source);
-                                push_symbol(symbols, name, SymbolKind::Class, &child, source);
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
-            _ => {}
         }
     }
 }
 
-// ── Rust extraction ───────────────────────────────────────────────────
+// ── Rust extraction ──────────────────────────────────────────────────
 
 fn extract_rust_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "function_item" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    let kind = if source[child.byte_range()].contains("async") {
-                        SymbolKind::AsyncFunction
-                    } else {
-                        SymbolKind::Function
-                    };
-                    push_symbol(symbols, name, kind, &child, source);
-                }
-            }
-            "struct_item" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Struct, &child, source);
-                }
-            }
-            "enum_item" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Enum, &child, source);
-                }
-            }
-            "trait_item" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Trait, &child, source);
-                }
-            }
-            "impl_item" => {
-                if let Some(name_node) = child.child_by_field_name("type") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Impl, &child, source);
-                }
-            }
-            _ => {}
-        }
-    }
+    extract_by_rules(node, source, RUST_RULES, symbols);
 }
 
-// ── Go extraction ─────────────────────────────────────────────────────
+// ── Go extraction ────────────────────────────────────────────────────
 
 fn extract_go_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
+    extract_by_rules(node, source, GO_RULES, symbols);
+
+    // Go-specific: type declarations and const/var blocks
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "function_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Function, &child, source);
-                }
-            }
-            "method_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(&name_node, source);
-                    push_symbol(symbols, name, SymbolKind::Method, &child, source);
-                }
-            }
             "type_declaration" => {
-                // type Foo struct { ... } or type Bar interface { ... }
                 let mut inner_cursor = child.walk();
                 for spec in child.children(&mut inner_cursor) {
                     if spec.kind() == "type_spec" {
@@ -431,14 +391,15 @@ fn extract_go_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
     }
 }
 
-// ── C/C++ extraction ──────────────────────────────────────────────────
+// ── C/C++ extraction ─────────────────────────────────────────────────
 
 fn extract_c_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
+    extract_by_rules(node, source, C_RULES, symbols);
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                // Find the declarator which contains the function name
                 if let Some(declarator) = child.child_by_field_name("declarator") {
                     if let Some(name) = find_c_function_name(&declarator, source) {
                         push_symbol(symbols, name, SymbolKind::Function, &child, source);
@@ -446,7 +407,6 @@ fn extract_c_symbols(node: &Node, source: &str, symbols: &mut Vec<Symbol>) {
                 }
             }
             "declaration" => {
-                // Struct/union/enum typedefs and forward declarations
                 if let Some(type_node) = child.child_by_field_name("type") {
                     match type_node.kind() {
                         "struct_specifier" | "union_specifier" => {
@@ -499,7 +459,7 @@ fn find_c_function_name(node: &Node, source: &str) -> Option<String> {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────
 
 fn node_text(node: &Node, source: &str) -> String {
     source[node.byte_range()].to_string()
@@ -509,8 +469,6 @@ fn push_symbol(symbols: &mut Vec<Symbol>, name: String, kind: SymbolKind, node: 
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
     let code = source[node.byte_range()].to_string();
-
-    // Build a signature (first line of the code block)
     let signature = code.lines().next().unwrap_or("").to_string();
 
     symbols.push(Symbol {

@@ -1,6 +1,12 @@
 use crate::indexer::embedding_client;
 use crate::indexer::symbol_extractor::Symbol;
 
+/// Compare two f32 scores for descending sort (highest first).
+/// Handles NaN by treating it as equal.
+pub fn cmp_score_desc(a: f32, b: f32) -> std::cmp::Ordering {
+    b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
+}
+
 /// Score multiple symbols' relevance to a query in one batch.
 /// Much faster than scoring individually — generates all embeddings in one model call.
 pub fn score_symbols_batch(
@@ -35,12 +41,12 @@ pub fn score_symbols_batch(
                 score += 0.3;
             }
 
-            // Keyword match in signature
+            // Keyword match in signature (word-boundary aware)
             for word in query_lower.split_whitespace() {
                 if word.len() < 3 {
                     continue;
                 }
-                if sig_lower.contains(word) {
+                if has_word_match(&sig_lower, word) {
                     score += 0.1;
                 }
             }
@@ -49,7 +55,7 @@ pub fn score_symbols_batch(
             if let (Some(qe), Some(ref embeds)) = (query_embedding, &sym_embeddings) {
                 if let Some(se) = embeds.get(i) {
                     let sim = embedding_client::cosine_similarity(qe, se);
-                    if sim > 0.3 {
+                    if sim > super::scoring::RELEVANCE_SIM_THRESHOLD {
                         score += sim * 0.4;
                     }
                 }
@@ -66,7 +72,29 @@ pub fn score_symbols_batch(
         .collect()
 }
 
-/// Score a single symbol's relevance to a query (for cases where batch isn't needed).
-pub fn score_symbol(symbol: &Symbol, query: &str, query_embedding: Option<&[f32]>) -> f32 {
-    score_symbols_batch(std::slice::from_ref(symbol), query, query_embedding)[0]
+/// Check if `needle` appears in `haystack` at a word boundary.
+/// A word boundary is: start/end of string, underscore, non-alphanumeric char,
+/// or a camelCase transition (lowercase followed by uppercase).
+pub fn has_word_match(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let mut search_from = 0;
+    while let Some(pos) = haystack[search_from..].find(needle) {
+        let abs_pos = search_from + pos;
+        let end_pos = abs_pos + needle.len();
+
+        let before_ok = abs_pos == 0
+            || !h[abs_pos - 1].is_ascii_alphanumeric()
+            || h[abs_pos - 1] == b'_';
+
+        let after_ok = end_pos >= h.len()
+            || !h[end_pos].is_ascii_alphanumeric()
+            || h[end_pos] == b'_'
+            || h[end_pos].is_ascii_uppercase();
+
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = abs_pos + 1;
+    }
+    false
 }

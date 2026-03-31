@@ -1,15 +1,13 @@
 use std::fmt::Write;
 use std::path::Path;
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::db::schema;
-use crate::indexer::embedding_client;
 
 /// Get a specific symbol (function/class/struct) by name.
 /// Returns the exact code block from the source file.
 pub fn get_symbol(project_path: &Path, name: &str, file_hint: Option<&str>) -> Result<String> {
     let db_path = schema::db_path(project_path);
-    let mut output = String::new();
 
     // Try indexed database first
     if db_path.exists() {
@@ -91,12 +89,19 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
     // For each match, read the actual code from the file
     for (sname, kind, start_line, end_line, _sig, rel_path) in &results {
         let file_path = project_path.join(rel_path);
+        let resolved = file_path.canonicalize()
+            .map_err(|_| anyhow::anyhow!("Cannot resolve path: {}", rel_path))?;
+        let canonical_project = project_path.canonicalize().unwrap_or_else(|_| project_path.to_path_buf());
+        if !resolved.starts_with(&canonical_project) {
+            bail!("Path escapes project directory: {}", rel_path);
+        }
+        let file_path = resolved;
         writeln!(&mut output, "## [{}] {} in {} (L{}-L{})\n", kind, sname, rel_path, start_line, end_line)?;
 
         if let Ok(content) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = content.lines().collect();
-            let start = (*start_line as usize).saturating_sub(1);
-            let end = (*end_line as usize).min(lines.len());
+            let start = ((*start_line).max(0) as usize).saturating_sub(1);
+            let end = ((*end_line).max(0) as usize).min(lines.len());
 
             // Include 2 lines of context before
             let ctx_start = start.saturating_sub(2);
@@ -126,10 +131,7 @@ fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
             }
         }
 
-        let has_ast = matches!(
-            file.extension.as_str(),
-            "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "py" | "pyi" | "rs"
-        );
+        let has_ast = crate::indexer::config::has_ast_support(&file.extension);
 
         if !has_ast {
             continue;

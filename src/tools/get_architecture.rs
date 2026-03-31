@@ -64,7 +64,7 @@ pub fn build_overview(project_path: &Path) -> Result<String> {
 
 fn collect_file_stats(dir: &Path) -> Result<Vec<(String, usize)>> {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    count_files_recursive(dir, &mut counts)?;
+    count_files_recursive(dir, &mut counts, 0, 20)?;
 
     let mut stats: Vec<_> = counts.into_iter().collect();
     stats.sort_by(|a, b| b.1.cmp(&a.1));
@@ -72,7 +72,11 @@ fn collect_file_stats(dir: &Path) -> Result<Vec<(String, usize)>> {
     Ok(stats)
 }
 
-fn count_files_recursive(dir: &Path, counts: &mut std::collections::HashMap<String, usize>) -> Result<()> {
+fn count_files_recursive(dir: &Path, counts: &mut std::collections::HashMap<String, usize>, depth: usize, max_depth: usize) -> Result<()> {
+    if depth >= max_depth {
+        return Ok(());
+    }
+
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -86,7 +90,7 @@ fn count_files_recursive(dir: &Path, counts: &mut std::collections::HashMap<Stri
 
         let path = entry.path();
         if path.is_dir() {
-            count_files_recursive(&path, counts)?;
+            count_files_recursive(&path, counts, depth + 1, max_depth)?;
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             *counts.entry(ext.to_string()).or_insert(0) += 1;
         }

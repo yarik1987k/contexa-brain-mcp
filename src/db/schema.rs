@@ -65,28 +65,70 @@ pub fn open_db(project_path: &Path) -> Result<Connection> {
         ",
     )?;
 
-    // Migration: add compressed embedding columns for TurboQuant
-    let has_compressed: bool = conn
+    // Migrations: run in a transaction to prevent partial schema updates
+    let needs_files_compressed: bool = conn
         .prepare("SELECT embedding_compressed FROM files LIMIT 0")
-        .is_ok();
-    if !has_compressed {
-        conn.execute_batch(
-            "ALTER TABLE files ADD COLUMN embedding_compressed BLOB;
-             ALTER TABLE symbols ADD COLUMN embedding_compressed BLOB;",
-        )?;
+        .is_err();
+    let needs_mem_compressed: bool = conn
+        .prepare("SELECT embedding_compressed FROM memories LIMIT 0")
+        .is_err();
+
+    if needs_files_compressed || needs_mem_compressed {
+        let tx = conn.unchecked_transaction()?;
+        if needs_files_compressed {
+            tx.execute_batch(
+                "ALTER TABLE files ADD COLUMN embedding_compressed BLOB;
+                 ALTER TABLE symbols ADD COLUMN embedding_compressed BLOB;",
+            )?;
+        }
+        if needs_mem_compressed {
+            tx.execute_batch(
+                "ALTER TABLE memories ADD COLUMN embedding_compressed BLOB;",
+            )?;
+        }
+        tx.commit()?;
     }
 
-    // Migration: add compressed embedding column for memories
-    let has_mem_compressed: bool = conn
-        .prepare("SELECT embedding_compressed FROM memories LIMIT 0")
-        .is_ok();
-    if !has_mem_compressed {
-        conn.execute_batch(
-            "ALTER TABLE memories ADD COLUMN embedding_compressed BLOB;",
-        )?;
+    // Migration: add import_count column for centrality ranking
+    let needs_import_count: bool = conn
+        .prepare("SELECT import_count FROM files LIMIT 0")
+        .is_err();
+    if needs_import_count {
+        conn.execute_batch("ALTER TABLE files ADD COLUMN import_count INTEGER DEFAULT 0;")?;
     }
 
     Ok(conn)
+}
+
+/// Delete a file and its symbols by relative path.
+pub fn delete_file_by_path(conn: &Connection, relative_path: &str) -> Result<()> {
+    let file_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM files WHERE relative_path = ?1",
+            rusqlite::params![relative_path],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(id) = file_id {
+        delete_file_symbols(conn, id)?;
+        conn.execute("DELETE FROM files WHERE id = ?1", [id])?;
+    }
+    Ok(())
+}
+
+/// Update import counts for all files in a single transaction.
+pub fn update_import_counts(conn: &Connection, counts: &std::collections::HashMap<String, u32>) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE files SET import_count = 0", [])?;
+    for (path, count) in counts {
+        tx.execute(
+            "UPDATE files SET import_count = ?1 WHERE relative_path = ?2",
+            rusqlite::params![*count as i64, path],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Store a file entry with its embedding and optional compressed embedding.
@@ -190,7 +232,12 @@ pub fn delete_file_symbols(conn: &Connection, file_id: i64) -> Result<()> {
 }
 
 /// Read an embedding blob back into a Vec<f32>.
+/// Returns empty vec if blob length is not a multiple of 4 (corrupted data).
 pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+    if blob.len() % 4 != 0 {
+        tracing::warn!("Embedding blob has invalid length {} (not a multiple of 4), skipping", blob.len());
+        return Vec::new();
+    }
     blob.chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
@@ -247,25 +294,33 @@ pub fn quantized_to_blob(qv: &QuantizedVector) -> Vec<u8> {
 }
 
 /// Deserialize a QuantizedVector from a blob.
+/// Returns None for invalid/corrupted data instead of panicking.
 pub fn blob_to_quantized(blob: &[u8]) -> Option<QuantizedVector> {
+    // Header: version(1) + bits(1) + mode(1) + original_dim(2) + padded_dim(2)
+    //       + norm(4) + residual_norm(4) + mse_len(2) = 17 bytes minimum
     if blob.len() < 17 { return None; }
     let version = blob[0];
     if version != 1 { return None; }
     let bits = blob[1];
-    let mode = match blob[2] { 0 => QuantMode::Fast, _ => QuantMode::Unbiased };
+    if !(1..=4).contains(&bits) { return None; }
+    let mode = match blob[2] { 0 => QuantMode::Fast, 1 => QuantMode::Unbiased, _ => return None };
     let original_dim = u16::from_le_bytes([blob[3], blob[4]]) as usize;
     let padded_dim = u16::from_le_bytes([blob[5], blob[6]]) as usize;
+    if original_dim == 0 || padded_dim == 0 || padded_dim < original_dim { return None; }
     let norm = f32::from_le_bytes([blob[7], blob[8], blob[9], blob[10]]);
     let residual_norm = f32::from_le_bytes([blob[11], blob[12], blob[13], blob[14]]);
     let mse_len = u16::from_le_bytes([blob[15], blob[16]]) as usize;
-    let mse_start = 17;
-    let mse_end = mse_start + mse_len;
-    if blob.len() < mse_end + 2 { return None; }
+    let mse_start: usize = 17;
+    let mse_end = mse_start.checked_add(mse_len)?;
+    if blob.len() < mse_end.checked_add(2)? { return None; }
     let mse_indices = blob[mse_start..mse_end].to_vec();
     let qjl_len = u16::from_le_bytes([blob[mse_end], blob[mse_end + 1]]) as usize;
     let qjl_start = mse_end + 2;
-    let qjl_bits = if qjl_len > 0 && blob.len() >= qjl_start + qjl_len {
-        Some(blob[qjl_start..qjl_start + qjl_len].to_vec())
+    let qjl_end = qjl_start.checked_add(qjl_len)?;
+    let qjl_bits = if qjl_len > 0 && blob.len() >= qjl_end {
+        Some(blob[qjl_start..qjl_end].to_vec())
+    } else if qjl_len > 0 {
+        return None; // Declared QJL data but blob too short
     } else {
         None
     };

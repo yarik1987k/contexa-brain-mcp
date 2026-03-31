@@ -22,7 +22,7 @@ pub fn recall(
     let mut output = String::new();
 
     // Generate query embedding for semantic search
-    let query_embedding = embedding_client::embed_text(query).ok();
+    let query_embedding = embedding_client::try_embed_text(query);
 
     // Prepare TurboQuant query vector once (reused for all compressed comparisons)
     let tq = embedding_client::get_turboquant();
@@ -96,11 +96,11 @@ pub fn recall(
         .collect();
 
     // Sort by score descending
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| crate::context::relevance_scorer::cmp_score_desc(a.0, b.0));
     scored.truncate(max_results as usize);
 
     // Filter out very low scores
-    let scored: Vec<_> = scored.into_iter().filter(|(s, _)| *s > 0.15).collect();
+    let scored: Vec<_> = scored.into_iter().filter(|(s, _)| *s > crate::context::scoring::MEMORY_MIN_SCORE).collect();
 
     if scored.is_empty() {
         writeln!(&mut output, "No relevant memories found for '{}'.", query)?;

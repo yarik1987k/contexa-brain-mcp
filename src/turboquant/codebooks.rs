@@ -8,6 +8,7 @@
 pub struct Codebook {
     pub centroids: Vec<f32>,
     pub boundaries: Vec<f32>,
+    #[allow(dead_code)]
     pub num_levels: usize,
 }
 
@@ -94,9 +95,9 @@ pub fn dequantize_vector(indices: &[u8], codebook: &Codebook) -> Vec<f32> {
 }
 
 /// Pack quantization indices into compact bytes.
-pub fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
+pub fn pack_indices(indices: &[u8], bits: u8) -> Result<Vec<u8>, &'static str> {
     let n = indices.len();
-    match bits {
+    Ok(match bits {
         1 => {
             let mut buf = vec![0u8; (n + 7) / 8];
             for i in 0..n {
@@ -138,12 +139,12 @@ pub fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
             }
             buf
         }
-        _ => panic!("Unsupported bit-width: {}", bits),
-    }
+        _ => return Err("Unsupported bit-width for pack_indices"),
+    })
 }
 
 /// Unpack indices from compact bytes.
-pub fn unpack_indices(buf: &[u8], bits: u8, n: usize) -> Vec<u8> {
+pub fn unpack_indices(buf: &[u8], bits: u8, n: usize) -> Result<Vec<u8>, &'static str> {
     let mut indices = vec![0u8; n];
     match bits {
         1 => {
@@ -177,7 +178,7 @@ pub fn unpack_indices(buf: &[u8], bits: u8, n: usize) -> Vec<u8> {
                 }
             }
         }
-        _ => panic!("Unsupported bit-width: {}", bits),
+        _ => return Err("Unsupported bit-width for unpack_indices"),
     }
-    indices
+    Ok(indices)
 }

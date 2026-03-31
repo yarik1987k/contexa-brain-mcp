@@ -2,16 +2,25 @@ use anyhow::Result;
 use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
 use std::sync::Mutex;
 
+/// Trait for embedding operations. Enables mocking in tests.
+pub trait EmbeddingProvider: Send + Sync {
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+}
+
+/// Production embedding provider using FastEmbed.
+pub struct FastEmbedProvider;
+
 /// Global embedding model — initialized once, reused across calls.
 static MODEL: std::sync::LazyLock<Result<Mutex<TextEmbedding>, String>> =
     std::sync::LazyLock::new(|| {
-        eprintln!("[context-brain] Initializing embedding model (multilingual-e5-small, first run may download ~90MB)...");
+        tracing::info!("Initializing embedding model (multilingual-e5-small, first run may download ~90MB)...");
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::MultilingualE5Small)
                 .with_show_download_progress(true),
         )
         .map_err(|e| format!("Failed to init embedding model: {}", e))?;
-        eprintln!("[context-brain] Embedding model ready");
+        tracing::info!("Embedding model ready");
         Ok(Mutex::new(model))
     });
 
@@ -22,53 +31,71 @@ fn get_model() -> Result<&'static Mutex<TextEmbedding>> {
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-/// Generate an embedding vector for a single text.
-/// Recovers from mutex poison (prior panic) by clearing the poison.
-pub fn embed_text(text: &str) -> Result<Vec<f32>> {
-    // Cap input length to prevent OOM in the model
-    let text = if text.len() > 8192 {
-        &text[..8192]
-    } else {
-        text
-    };
-
+/// Acquire the model lock, recovering from mutex poison if necessary.
+/// Safety: TextEmbedding is a stateless inference engine — a prior panic
+/// during `embed()` cannot corrupt its internal state because the model
+/// weights are read-only and the only mutable state (output buffers) is
+/// allocated fresh each call.
+fn acquire_model() -> Result<std::sync::MutexGuard<'static, TextEmbedding>> {
     let mutex = get_model()?;
-    // Recover from poison: if a prior call panicked, the mutex is poisoned
-    // but the inner data is still valid (TextEmbedding doesn't have invariants
-    // that a panic could violate). Use into_inner() on the poison error.
-    let model = match mutex.lock() {
-        Ok(guard) => guard,
+    match mutex.lock() {
+        Ok(guard) => Ok(guard),
         Err(poisoned) => {
-            eprintln!("[context-brain] WARNING: Embedding mutex was poisoned, recovering...");
-            poisoned.into_inner()
+            tracing::warn!("Embedding mutex was poisoned, recovering (TextEmbedding is stateless)");
+            Ok(poisoned.into_inner())
         }
-    };
-    let embeddings = model.embed(vec![text], None)?;
-    embeddings
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No embedding returned"))
+    }
+}
+
+/// Truncate a string to at most `max_bytes`, respecting UTF-8 char boundaries.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Find the last char boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+const MAX_EMBED_INPUT: usize = 8192;
+
+impl EmbeddingProvider for FastEmbedProvider {
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let text = truncate_utf8(text, MAX_EMBED_INPUT);
+        let model = acquire_model()?;
+        let embeddings = model.embed(vec![text], None)?;
+        embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No embedding returned"))
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let capped: Vec<&str> = texts.iter().map(|t| truncate_utf8(t, MAX_EMBED_INPUT)).collect();
+        let model = acquire_model()?;
+        let embeddings = model.embed(capped, None)?;
+        Ok(embeddings)
+    }
+
+}
+
+// ── Free functions delegating to global FastEmbedProvider ──────────────
+// These preserve the existing API so callers don't need to change.
+
+/// Generate an embedding vector for a single text.
+pub fn embed_text(text: &str) -> Result<Vec<f32>> {
+    FastEmbedProvider.embed_text(text)
 }
 
 /// Generate embeddings for a batch of texts.
-/// More efficient than calling embed_text in a loop.
 pub fn embed_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-    if texts.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Cap each input
-    let capped: Vec<&str> = texts.iter().map(|t| {
-        if t.len() > 8192 { &t[..8192] } else { t }
-    }).collect();
-
-    let mutex = get_model()?;
-    let model = match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let embeddings = model.embed(capped, None)?;
-    Ok(embeddings)
+    FastEmbedProvider.embed_batch(texts)
 }
 
 /// Compute cosine similarity between two vectors.
@@ -92,6 +119,30 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         0.0
     } else {
         dot / denom
+    }
+}
+
+/// Try to generate an embedding, logging a warning on failure.
+/// Returns None instead of propagating the error — use this when embeddings
+/// are optional (search, scoring) vs. `embed_text` when they're required.
+pub fn try_embed_text(text: &str) -> Option<Vec<f32>> {
+    match embed_text(text) {
+        Ok(e) => Some(e),
+        Err(err) => {
+            tracing::warn!("Embedding generation failed (non-fatal): {}", err);
+            None
+        }
+    }
+}
+
+/// Try to generate batch embeddings, logging a warning on failure.
+pub fn try_embed_batch(texts: &[&str]) -> Vec<Vec<f32>> {
+    match embed_batch(texts) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!("Batch embedding generation failed (non-fatal): {}", err);
+            Vec::new()
+        }
     }
 }
 

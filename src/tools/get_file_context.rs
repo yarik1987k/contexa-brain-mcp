@@ -69,14 +69,7 @@ fn read_symbols(content: &str, path: &Path) -> Result<String> {
 
     writeln!(&mut output, "# Symbols in {} ({} lines)\n", path.display(), line_count)?;
 
-    let has_ast = matches!(
-        ext,
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
-        | "py" | "pyi"
-        | "rs"
-        | "go"
-        | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx"
-    );
+    let has_ast = crate::indexer::config::has_ast_support(ext);
 
     if has_ast {
         match symbol_extractor::extract_symbols(content, ext) {
