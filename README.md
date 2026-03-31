@@ -2,15 +2,18 @@
 
 Intelligent MCP context manager for AI coding assistants. Sits between your IDE and Claude/GPT to reduce token usage and remember context across sessions.
 
+**~5,200 lines of Rust** | **34 tests** | **0 unsafe code** | **0 compiler warnings**
+
 ## What It Does
 
-- **Smart file reading** — sends function signatures instead of full files, query-aware mode includes full code only for relevant functions
-- **Semantic search** — finds code by meaning using local embeddings, combined with keyword matching and import-centrality ranking
-- **Persistent memory** — saves decisions across sessions with semantic recall, never re-explain your architecture
-- **File watching** — automatically re-indexes changed files in the background, keeping search results fresh
+- **Smart file reading** — AST-based symbol extraction sends signatures instead of full files; query-aware mode includes full code only for relevant functions
+- **Semantic search** — local embeddings (multilingual-e5-small, supports Hebrew and 100+ languages) combined with keyword matching, word-boundary awareness, and import-centrality ranking
+- **Persistent memory** — saves decisions across sessions with semantic recall (cosine similarity + keyword + recency scoring)
+- **File watching** — debounced filesystem watcher automatically re-indexes changed files in the background via incremental indexing
+- **Import-centrality ranking** — files imported by many others are boosted in search results
 - **Works with** Cursor, Claude Code, and any MCP-compatible editor
 
-## Quick Setup (2 minutes)
+## Quick Setup
 
 ### 1. Build from source
 
@@ -23,7 +26,7 @@ cargo build --release
 
 The binary is at `./target/release/context-brain`.
 
-> **First run note:** The embedding model (~90MB, multilingual-e5-small) downloads automatically on first use. Subsequent runs are instant.
+> **First run:** The embedding model (~90MB, multilingual-e5-small) downloads automatically on first use. Subsequent runs are instant. If the model fails to load, the server still works with keyword-only search and displays a warning in results.
 
 ### 2. Add to your editor
 
@@ -82,7 +85,7 @@ You should see `context-brain` in your MCP settings with 8 tools enabled.
 ## CLI Usage
 
 ```bash
-# Start MCP server
+# Start MCP server (also starts file watcher)
 context-brain serve --project /path/to/project
 
 # Build search index
@@ -108,80 +111,143 @@ context-brain recall --query "authentication" --project .
 
 ### Indexing pipeline
 
-1. Walk project files (respects .gitignore)
-2. Extract symbols via tree-sitter AST parsing (JS/TS, Python, Rust, Go, C/C++)
-3. Generate embeddings using FastEmbed (local, no API calls)
-4. Compress embeddings with TurboQuant (2-bit quantization, 90% size reduction)
-5. Build import graph for centrality ranking
-6. Store in SQLite with FTS5 full-text search
+1. Walk project files (respects .gitignore via `ignore` crate)
+2. Content-hash diffing — skip unchanged files
+3. Extract symbols via tree-sitter AST parsing (JS/TS, Python, Rust, Go, C/C++)
+4. Batch-generate embeddings using FastEmbed (local, no API calls, 60s timeout)
+5. Compress embeddings with TurboQuant (2-bit quantization, ~90% size reduction)
+6. Build import graph for centrality ranking
+7. Store in SQLite with FTS5 full-text search
 
 ### File watching
 
-The server watches the project directory for changes and automatically re-indexes modified files. No manual re-indexing needed during development.
+The server watches the project directory using the `notify` crate. Events are debounced (500ms via `tokio::time::sleep`) to handle rapid editor saves. Changed files are incrementally re-indexed without rebuilding the full index.
 
 ### Search scoring
 
-Results are ranked by combining multiple signals:
+Results are ranked by combining multiple signals (constants defined in `scoring.rs`):
 
 | Signal | Max score | Description |
 |---|---|---|
 | Exact name match | 5.0 | Symbol name equals query |
-| Substring match | 3.0 | Query is part of symbol name |
-| Embedding similarity | 5.0 | Semantic similarity via cosine distance |
+| Substring match | 3.0 | Query is part of symbol name (word-boundary aware) |
+| Embedding similarity | 5.0 | Cosine similarity via TurboQuant compressed vectors |
 | Path match | 4.0 | Query found in file path |
-| Import centrality | 2.0 | Files imported by many others rank higher |
+| Import centrality | 2.0 | Logarithmic boost for hub files (imported by many others) |
+
+Word-boundary matching prevents false positives — "get" matches `getUser` and `get_data` but not `target` or `budget`.
+
+### Memory recall scoring
+
+| Signal | Weight | Description |
+|---|---|---|
+| Semantic similarity | 0.7 | Embedding cosine distance (TurboQuant fast path) |
+| Keyword match | 0.2 | Full-text or partial word matching |
+| Recency | 0.1 | Newer memories ranked higher |
 
 ### Language support
 
 | Feature | Languages |
 |---|---|
 | AST symbol extraction | JavaScript, TypeScript, Python, Rust, Go, C, C++ |
-| Import graph analysis | JS/TS (import/require), Python, Rust, Go, C/C++ |
+| Import graph analysis | JS/TS (import/require/export), Python (import/from), Rust (use/mod), Go (import), C/C++ (#include) |
 | Keyword search | All text files |
+
+### Embedding model
+
+Uses **multilingual-e5-small** (384 dimensions, ~90MB) via FastEmbed. Runs locally with zero API calls. Supports 100+ languages including Hebrew, making it suitable for codebases with non-English comments and documentation.
+
+If the model fails to load, the server degrades gracefully to keyword-only search and displays a warning in results.
+
+### TurboQuant compression
+
+Custom 2-bit vector quantization that reduces embedding storage by ~90%:
+
+1. Random rotation via Fast Walsh-Hadamard Transform
+2. Lloyd-Max optimal Gaussian codebooks for quantization
+3. Packed bit storage (96 bytes per 384-dim vector vs 1,536 bytes raw)
+
+Search uses `fast_cosine_similarity` directly on compressed vectors — no decompression needed.
 
 ## Architecture
 
 ```
 src/
-  server.rs           # MCP server + file watcher integration
-  tools/              # MCP tool implementations
-    search_codebase/   # Semantic + keyword search (indexed & live)
-    get_file_context.rs
-    get_symbol.rs
-    get_architecture.rs
-    list_files.rs
-  indexer/             # Code indexing pipeline
-    pipeline.rs        # Full + incremental indexing
-    symbol_extractor.rs # Tree-sitter AST parsing
-    import_extractor.rs # Import graph extraction
-    embedding_client.rs # FastEmbed + TurboQuant
-    watch_manager.rs   # File system watcher
-    file_walker.rs     # .gitignore-aware file discovery
-  context/             # Context optimization
-    file_summarizer.rs # Smart query-aware summarization
-    relevance_scorer.rs # Symbol relevance scoring
-    token_estimator.rs # Token counting heuristics
-    scoring.rs         # Centralized scoring constants
-  memory/              # Persistent memory
-    store.rs           # Save with embeddings
-    searcher.rs        # Semantic recall
-  db/schema.rs         # SQLite schema + migrations
-  turboquant/          # Embedding compression (2-bit quantization)
+  server.rs              # MCP server, auto-indexing, file watcher startup
+  lib.rs                 # Library exports for testing
+  main.rs                # CLI entry point (serve, index, search, etc.)
+  tools/                 # MCP tool implementations
+    search_codebase/     # Split into indexed.rs, live.rs, types.rs
+    get_file_context.rs  # Smart file reading (full/summary/smart/symbols)
+    get_symbol.rs        # Extract specific function/class by name
+    get_architecture.rs  # Project overview generation
+    list_files.rs        # Directory tree with metadata
+  indexer/               # Code indexing pipeline
+    pipeline.rs          # Full + incremental indexing (shared embed_and_store)
+    symbol_extractor.rs  # Tree-sitter AST parsing (data-driven rules)
+    import_extractor.rs  # Import graph extraction (comment-aware)
+    embedding_client.rs  # FastEmbed provider trait + TurboQuant integration
+    watch_manager.rs     # Async file watcher with debouncing
+    file_walker.rs       # .gitignore-aware file discovery
+    config.rs            # Centralized extension lists and skip dirs
+  context/               # Context optimization
+    file_summarizer.rs   # Query-aware AST summarization
+    relevance_scorer.rs  # Symbol scoring + word boundary matching
+    token_estimator.rs   # Token counting heuristics
+    scoring.rs           # All scoring constants in one place
+  memory/                # Persistent cross-session memory
+    store.rs             # Save with embeddings + TurboQuant compression
+    searcher.rs          # Semantic + keyword + recency recall
+  db/schema.rs           # SQLite schema, migrations, blob serialization
+  turboquant/            # Embedding compression engine
+    mod.rs               # Quantize, fast similarity, prepare query
+    codebooks.rs         # Lloyd-Max Gaussian codebooks + bit packing
+    rotation.rs          # FWHT random rotation
+    qjl.rs               # Quantized Johnson-Lindenstrauss projection
 ```
+
+### Key design decisions
+
+- **All blocking I/O in `spawn_blocking`** — MCP tool handlers are async but all file reads, DB queries, and embedding calls run in the blocking thread pool
+- **Embedding timeout** — 60s timeout via thread-spawn-with-channel pattern (MutexGuard can't cross thread boundaries, so the spawned thread acquires the lock itself)
+- **EmbeddingProvider trait** — abstracts the embedding model for testability; production uses `FastEmbedProvider`, tests can mock
+- **Data-driven symbol extraction** — language rules defined as const tables, reducing boilerplate across 6 language extractors
+- **Single source of truth for extensions** — `config.rs` defines `AST_EXTENSIONS`, `SOURCE_EXTENSIONS`, `SKIP_DIRS`; no hardcoded lists elsewhere
 
 ## Running Tests
 
 ```bash
-cargo test
+cargo test        # 34 tests
+cargo check       # 0 warnings
+cargo clippy      # style warnings only, no correctness issues
 ```
 
-27 tests covering symbol extraction (5 languages), import extraction, bit-packing round-trips, TurboQuant quantization, and scoring.
+### Test coverage
+
+| Area | Tests | Notes |
+|---|---|---|
+| Symbol extraction | 7 | JS, TS, Python, Rust, Go + edge cases |
+| Import extraction | 5 | JS, Python, Rust, C + comment skipping |
+| Import resolution | 2 | Path resolution + count accumulation |
+| Bit packing | 4 | Round-trip for 2/3/4-bit + invalid input |
+| TurboQuant | 4 | Quantize/dequantize, similarity, compression, zero vector |
+| Scoring | 4 | Constants sanity, exact match, substring match, word boundaries |
+| Word boundaries | 2 | False positive prevention, camelCase/snake_case |
+| Token estimation | 4 | Empty, single word, code line, budget check |
+| Misc | 2 | Unicode safety, model availability |
+
+### Known gaps
+
+- No end-to-end tests (index a project, search it, verify results)
+- No tests that touch the database or MCP server
+- Import extraction is string-based (doesn't handle imports inside string literals or multi-line imports)
 
 ## Requirements
 
 - Rust 1.75+ (for building)
 - macOS or Linux
-- No external dependencies at runtime (embeddings run locally, SQLite bundled)
+- ~90MB disk for embedding model (downloaded on first run)
+- No external API calls at runtime — everything runs locally
 
 ## License
 
