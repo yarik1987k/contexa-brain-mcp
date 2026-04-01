@@ -15,7 +15,7 @@ fn truncate_sig(sig: &str, max_chars: usize) -> String {
 }
 
 /// Fast search using the pre-built index.
-pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_budget: u32) -> Result<String> {
+pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_budget: u32, detail: &str) -> Result<String> {
     let conn = schema::open_db(project_path)?;
     let mut output = String::new();
     let mut matches: Vec<SearchMatch> = Vec::new();
@@ -130,13 +130,14 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
                     score *= 0.2;
                 }
 
+                let kind_short = crate::indexer::symbol_extractor::abbreviate_kind(&row.kind).to_string();
                 let sig = truncate_sig(&row.signature, 80);
                 let sym_line = format!(
                     "[{}] {} L{}-{}: {}",
-                    crate::indexer::symbol_extractor::abbreviate_kind(&row.kind),
-                    row.name, row.start_line, row.end_line, sig
+                    kind_short, row.name, row.start_line, row.end_line, sig
                 );
-                upsert_match(&mut matches, &mut match_index, &row.file_path, score, None, Some(sym_line));
+                let pointer = (row.name.clone(), kind_short, row.start_line);
+                upsert_match(&mut matches, &mut match_index, &row.file_path, score, None, Some(sym_line), Some(pointer));
             }
         }
     }
@@ -180,7 +181,7 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
             };
 
             if sim > scoring::SEARCH_FILE_SIM_THRESHOLD {
-                upsert_match(&mut matches, &mut match_index, &path, sim * scoring::SEARCH_FILE_SIM_WEIGHT, None, None);
+                upsert_match(&mut matches, &mut match_index, &path, sim * scoring::SEARCH_FILE_SIM_WEIGHT, None, None, None);
             }
         }
     }
@@ -196,7 +197,7 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
         })?.filter_map(|r| r.ok()).collect();
 
         for path in &paths {
-            upsert_match(&mut matches, &mut match_index, path, scoring::SEARCH_PATH_MATCH_BONUS, None, None);
+            upsert_match(&mut matches, &mut match_index, path, scoring::SEARCH_PATH_MATCH_BONUS, None, None, None);
         }
 
         // Also match individual query words against file paths (with prefix matching)
@@ -217,7 +218,7 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
                 }).count();
                 if matched > 0 {
                     let fraction = matched as f32 / query_words.len().max(1) as f32;
-                    upsert_match(&mut matches, &mut match_index, file_path, fraction * scoring::SEARCH_PATH_MATCH_BONUS, None, None);
+                    upsert_match(&mut matches, &mut match_index, file_path, fraction * scoring::SEARCH_PATH_MATCH_BONUS, None, None, None);
                 }
             }
         }
@@ -309,6 +310,6 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
     matches.sort_by(|a, b| crate::context::relevance_scorer::cmp_score_desc(a.score, b.score));
     matches.truncate(max_results as usize);
 
-    format_results(&matches, query, token_budget, &mut output)?;
+    format_results(&matches, query, token_budget, detail, &mut output)?;
     Ok(output)
 }

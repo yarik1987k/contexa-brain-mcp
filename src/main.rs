@@ -56,6 +56,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value_t = 10)]
         max_results: u32,
+        /// Detail level: pointers, signatures, code
+        #[arg(short, long, default_value = "signatures")]
+        detail: String,
     },
     /// Save a memory
     Remember {
@@ -135,9 +138,9 @@ async fn main() -> Result<()> {
             let result = tools::get_file_context::read_file_context(&path, &mode, 3000, None)?;
             print!("{}", result);
         }
-        Commands::Search { query, project, max_results } => {
+        Commands::Search { query, project, max_results, detail } => {
             let project_path = std::fs::canonicalize(&project)?;
-            let result = tools::search_codebase::search(&project_path, &query, max_results, 4000)?;
+            let result = tools::search_codebase::search(&project_path, &query, max_results, 4000, &detail)?;
             print!("{}", result);
         }
         Commands::Remember { content, category, project } => {

@@ -49,10 +49,12 @@ pub struct GetSymbolParams {
 pub struct SearchCodebaseParams {
     #[schemars(description = "Natural language query or keyword to search for")]
     pub query: String,
-    #[schemars(description = "Max results to return (default: 10)")]
+    #[schemars(description = "Max results to return (default: 7)")]
     pub max_results: Option<u32>,
-    #[schemars(description = "Max tokens to return (default: 3000)")]
+    #[schemars(description = "Max tokens to return (default: 2500)")]
     pub token_budget: Option<u32>,
+    #[schemars(description = "Detail level: 'pointers' (file+line+name only — minimal tokens), 'signatures' (+ type signatures), 'code' (+ function bodies). Default: 'pointers'")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -213,7 +215,8 @@ impl ContextBrainServer {
         let result = tokio::task::spawn_blocking(move || {
             let max = params.max_results.unwrap_or(7);
             let budget = params.token_budget.unwrap_or(2500);
-            tools::search_codebase::search(&project_path, &params.query, max, budget)
+            let detail = params.detail.unwrap_or_else(|| "pointers".to_string());
+            tools::search_codebase::search(&project_path, &params.query, max, budget, &detail)
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Search failed: {}", e), None))?;
 

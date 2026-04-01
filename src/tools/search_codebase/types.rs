@@ -9,6 +9,8 @@ pub(super) struct SearchMatch {
     pub score: f32,
     pub context_lines: Vec<ContextLine>,
     pub symbol_matches: Vec<String>,
+    /// Compact symbol info for pointer mode: (name, kind_short, start_line)
+    pub symbol_pointers: Vec<(String, String, usize)>,
 }
 
 pub(super) struct ContextLine {
@@ -51,6 +53,7 @@ pub(super) fn upsert_match(
     score_delta: f32,
     context_line: Option<ContextLine>,
     symbol_match: Option<String>,
+    symbol_pointer: Option<(String, String, usize)>,
 ) {
     if let Some(&idx) = index.get(path) {
         let entry = &mut matches[idx];
@@ -58,6 +61,11 @@ pub(super) fn upsert_match(
         if let Some(sym) = symbol_match {
             if entry.symbol_matches.len() < 3 {
                 entry.symbol_matches.push(sym);
+            }
+        }
+        if let Some(ptr) = symbol_pointer {
+            if entry.symbol_pointers.len() < 3 {
+                entry.symbol_pointers.push(ptr);
             }
         }
         if let Some(ctx) = context_line {
@@ -77,14 +85,15 @@ pub(super) fn upsert_match(
             score: score_delta,
             context_lines: context_line.into_iter().collect(),
             symbol_matches: symbol_match.into_iter().collect(),
+            symbol_pointers: symbol_pointer.into_iter().collect(),
         });
     }
 }
 
-pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget: u32, output: &mut String) -> Result<()> {
+pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget: u32, detail: &str, output: &mut String) -> Result<()> {
     // Warn user if semantic search is unavailable
     if !crate::indexer::embedding_client::is_model_available() {
-        writeln!(output, "Warning: No semantic search — keyword matching only.\n")?;
+        writeln!(output, "(keyword-only mode)\n")?;
     }
 
     if matches.is_empty() {
@@ -97,16 +106,49 @@ pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget:
     for m in matches {
         let mut entry = String::new();
 
-        if !m.symbol_matches.is_empty() {
-            for sym in &m.symbol_matches {
-                writeln!(&mut entry, "{}: {}", m.relative_path, sym)?;
+        match detail {
+            "pointers" => {
+                // Minimal: file + name + line only
+                if !m.symbol_pointers.is_empty() {
+                    for (name, kind, line) in &m.symbol_pointers {
+                        writeln!(&mut entry, "{} L{} [{}] {}", m.relative_path, line, kind, name)?;
+                    }
+                } else if !m.context_lines.is_empty() {
+                    writeln!(&mut entry, "{} L{}", m.relative_path, m.context_lines[0].line_num)?;
+                } else {
+                    writeln!(&mut entry, "{}", m.relative_path)?;
+                }
             }
-        } else if !m.context_lines.is_empty() {
-            for ctx in &m.context_lines {
-                writeln!(&mut entry, "{} L{}: {}", m.relative_path, ctx.line_num, ctx.content.trim_start())?;
+            "code" => {
+                // Full: include signatures + context lines
+                if !m.symbol_matches.is_empty() {
+                    for sym in &m.symbol_matches {
+                        writeln!(&mut entry, "{}: {}", m.relative_path, sym)?;
+                    }
+                }
+                if !m.context_lines.is_empty() {
+                    for ctx in &m.context_lines {
+                        writeln!(&mut entry, "{} L{}: {}", m.relative_path, ctx.line_num, ctx.content.trim_start())?;
+                    }
+                }
+                if m.symbol_matches.is_empty() && m.context_lines.is_empty() {
+                    writeln!(&mut entry, "{}", m.relative_path)?;
+                }
             }
-        } else {
-            writeln!(&mut entry, "{}", m.relative_path)?;
+            _ => {
+                // "signatures" — current behavior (default fallback)
+                if !m.symbol_matches.is_empty() {
+                    for sym in &m.symbol_matches {
+                        writeln!(&mut entry, "{}: {}", m.relative_path, sym)?;
+                    }
+                } else if !m.context_lines.is_empty() {
+                    for ctx in &m.context_lines {
+                        writeln!(&mut entry, "{} L{}: {}", m.relative_path, ctx.line_num, ctx.content.trim_start())?;
+                    }
+                } else {
+                    writeln!(&mut entry, "{}", m.relative_path)?;
+                }
+            }
         }
 
         let entry_tokens = token_estimator::estimate_tokens(&entry) as u32;

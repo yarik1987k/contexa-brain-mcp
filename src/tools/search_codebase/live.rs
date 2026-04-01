@@ -13,7 +13,7 @@ fn truncate_sig(sig: &str, max_chars: usize) -> String {
 }
 
 /// Live scan fallback when no index exists.
-pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_budget: u32) -> Result<String> {
+pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_budget: u32, detail: &str) -> Result<String> {
     let mut output = String::new();
     let query_lower = query.to_lowercase();
     let files = file_walker::walk_project(project_path)?;
@@ -26,6 +26,7 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
         score: f32,
         context_lines: Vec<ContextLine>,
         symbol_matches: Vec<String>,
+        symbol_pointers: Vec<(String, String, usize)>,
         summary: String, // for batch embedding
     }
 
@@ -44,6 +45,7 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
         let mut score: f32 = 0.0;
         let mut context_lines: Vec<ContextLine> = Vec::new();
         let mut symbol_matches: Vec<String> = Vec::new();
+        let mut symbol_pointers: Vec<(String, String, usize)> = Vec::new();
 
         if file.relative_path.to_lowercase().contains(&query_lower) {
             score += scoring::SEARCH_EXACT_NAME_BONUS;
@@ -68,11 +70,13 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
                     if crate::context::relevance_scorer::has_word_match(&sym.name.to_lowercase(), &query_lower) {
                         score += scoring::SEARCH_SUBSTRING_NAME_BONUS;
                         if symbol_matches.len() < 3 {
+                            let kind_short = sym.kind.short().to_string();
                             let sig = truncate_sig(&sym.signature, 80);
                             symbol_matches.push(format!(
                                 "[{}] {} L{}-{}: {}",
-                                sym.kind.short(), sym.name, sym.start_line, sym.end_line, sig
+                                kind_short, sym.name, sym.start_line, sym.end_line, sig
                             ));
+                            symbol_pointers.push((sym.name.clone(), kind_short, sym.start_line));
                         }
                     }
                 }
@@ -83,7 +87,7 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
             let summary = format!("{}\n{}", file.relative_path, content.chars().take(scoring::LIVE_SEARCH_SUMMARY_CHARS).collect::<String>());
             candidates.push(Candidate {
                 relative_path: file.relative_path.clone(),
-                score, context_lines, symbol_matches, summary,
+                score, context_lines, symbol_matches, symbol_pointers, summary,
             });
             if candidates.len() >= crate::context::scoring::MAX_SEARCH_MATCHES {
                 break;
@@ -112,11 +116,12 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
         score: c.score,
         context_lines: c.context_lines,
         symbol_matches: c.symbol_matches,
+        symbol_pointers: c.symbol_pointers,
     }).collect();
 
     matches.sort_by(|a, b| crate::context::relevance_scorer::cmp_score_desc(a.score, b.score));
     matches.truncate(max_results as usize);
 
-    format_results(&matches, query, token_budget, &mut output)?;
+    format_results(&matches, query, token_budget, detail, &mut output)?;
     Ok(output)
 }
