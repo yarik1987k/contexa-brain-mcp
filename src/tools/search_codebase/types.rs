@@ -104,7 +104,7 @@ pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget:
     let mut budget_used = token_estimator::estimate_tokens(output) as u32;
     let mut last_dir = String::new();
 
-    for m in matches {
+    for (idx, m) in matches.iter().enumerate() {
         let mut entry = String::new();
 
         // Extract directory for path grouping
@@ -116,7 +116,12 @@ pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget:
 
         match detail {
             "pointers" => {
-                if !m.symbol_pointers.is_empty() {
+                // Top result gets signature for immediate context; rest get pointers only
+                if idx == 0 && !m.symbol_matches.is_empty() {
+                    for sym in &m.symbol_matches {
+                        writeln!(&mut entry, "{}: {}", display_path, sym)?;
+                    }
+                } else if !m.symbol_pointers.is_empty() {
                     for (name, kind, line) in &m.symbol_pointers {
                         writeln!(&mut entry, "{} L{} [{}] {}", display_path, line, kind, name)?;
                     }

@@ -43,7 +43,7 @@ pub struct GetSymbolParams {
     pub name: String,
     #[schemars(description = "File path hint to narrow search")]
     pub file: Option<String>,
-    #[schemars(description = "Max lines of code to return per symbol (default: 50). Pass 0 for unlimited.")]
+    #[schemars(description = "Max code lines per symbol (default: 30). Pass 0 for full.")]
     pub max_lines: Option<usize>,
 }
 
@@ -51,7 +51,7 @@ pub struct GetSymbolParams {
 pub struct SearchCodebaseParams {
     #[schemars(description = "Natural language query or keyword to search for")]
     pub query: String,
-    #[schemars(description = "Max results to return (default: 7)")]
+    #[schemars(description = "Max results (default: 5)")]
     pub max_results: Option<u32>,
     #[schemars(description = "Max tokens to return (default: 2500)")]
     pub token_budget: Option<u32>,
@@ -201,7 +201,7 @@ impl ContextBrainServer {
     ) -> Result<CallToolResult, McpError> {
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let max_lines = params.max_lines.unwrap_or(50);
+            let max_lines = params.max_lines.unwrap_or(30);
             tools::get_symbol::get_symbol(&project_path, &params.name, params.file.as_deref(), max_lines)
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Failed to get symbol: {}", e), None))?;
@@ -216,7 +216,7 @@ impl ContextBrainServer {
     ) -> Result<CallToolResult, McpError> {
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let max = params.max_results.unwrap_or(7);
+            let max = params.max_results.unwrap_or(5);
             let budget = params.token_budget.unwrap_or(2500);
             let detail = params.detail.unwrap_or_else(|| "pointers".to_string());
             tools::search_codebase::search(&project_path, &params.query, max, budget, &detail)

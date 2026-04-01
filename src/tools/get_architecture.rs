@@ -87,14 +87,13 @@ fn extract_doc_skeleton(content: &str, char_budget: usize) -> String {
             chars_used += line.len() + 1;
             lines_since_header = 0;
         } else if is_blank {
-            // Include blank lines to preserve readability (cheap)
-            if lines_since_header > 0 && lines_since_header < 12 {
+            if lines_since_header > 0 && lines_since_header < 6 {
                 result.push('\n');
                 chars_used += 1;
                 lines_since_header += 1;
             }
-        } else if lines_since_header < 12 {
-            // Include up to 25 content lines per section (prose, lists, tables)
+        } else if lines_since_header < 6 {
+            // Include up to 6 content lines per section
             if chars_used + line.len() + 2 > char_budget {
                 result.push_str("\n... [truncated — use get_file_context for full content]\n");
                 break;

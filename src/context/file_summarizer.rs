@@ -67,15 +67,15 @@ pub fn smart_summarize(
     // Sort by relevance (highest first)
     scored.sort_by(|a, b| relevance_scorer::cmp_score_desc(a.0, b.0));
 
-    // Always include imports (cheap, provides context) — cap at 5 lines
+    // Compact imports: count + module names only
     let imports = extract_imports(content, ext);
     if !imports.is_empty() {
         let import_lines: Vec<&str> = imports.lines().collect();
-        if import_lines.len() <= 5 {
-            writeln!(&mut output, "Imports:\n{}\n", imports)?;
+        let modules = extract_module_names(&imports, ext);
+        if modules.is_empty() {
+            writeln!(&mut output, "Imports: {}\n", import_lines.len())?;
         } else {
-            let shown: String = import_lines[..5].join("\n");
-            writeln!(&mut output, "Imports:\n{}\n... +{} more\n", shown, import_lines.len() - 5)?;
+            writeln!(&mut output, "Imports({}): {}\n", import_lines.len(), modules.join(", "))?;
         }
     }
 
@@ -88,16 +88,15 @@ pub fn smart_summarize(
         }
 
         if *score > scoring::RELEVANCE_HIGH_THRESHOLD {
-            // High relevance: include code body (truncated if large)
-            let lines_span = sym.end_line.saturating_sub(sym.start_line) + 1;
-            let code_to_show = if lines_span > scoring::MAX_BODY_LINES_IN_SUMMARY + 10 {
-                let truncated: String = sym.code.lines()
-                    .take(scoring::MAX_BODY_LINES_IN_SUMMARY)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("{}\n// ... +{} more lines", truncated, lines_span - scoring::MAX_BODY_LINES_IN_SUMMARY)
+            // High relevance: include code body (stripped + truncated)
+            let stripped_code = strip_comments(&sym.code, ext);
+            let stripped_lines: Vec<&str> = stripped_code.lines().collect();
+            let code_to_show = if stripped_lines.len() > scoring::MAX_BODY_LINES_IN_SUMMARY + 10 {
+                let truncated: String = stripped_lines[..scoring::MAX_BODY_LINES_IN_SUMMARY].join("\n");
+                let remaining = stripped_lines.len() - scoring::MAX_BODY_LINES_IN_SUMMARY;
+                format!("{}\n// ... +{} more lines", truncated, remaining)
             } else {
-                sym.code.clone()
+                stripped_code
             };
             let code_tokens = token_estimator::estimate_tokens(&code_to_show) as u32;
 
@@ -151,15 +150,15 @@ fn structural_summary(
     let lines: Vec<&str> = content.lines().collect();
     let char_budget = token_estimator::tokens_to_chars(token_budget);
 
-    // Imports (cap at 8 lines)
+    // Compact imports: count + module names
     let imports = extract_imports(content, ext);
     if !imports.is_empty() {
         let import_lines: Vec<&str> = imports.lines().collect();
-        if import_lines.len() <= 5 {
-            writeln!(output, "Imports:\n{}\n", imports)?;
+        let modules = extract_module_names(&imports, ext);
+        if modules.is_empty() {
+            writeln!(output, "Imports: {}\n", import_lines.len())?;
         } else {
-            let shown: String = import_lines[..5].join("\n");
-            writeln!(output, "Imports:\n{}\n... +{} more\n", shown, import_lines.len() - 5)?;
+            writeln!(output, "Imports({}): {}\n", import_lines.len(), modules.join(", "))?;
         }
     }
 
@@ -213,6 +212,83 @@ fn extract_imports(content: &str, ext: &str) -> String {
         .filter(|l| is_import_line(l.trim(), ext))
         .collect::<Vec<&str>>()
         .join("\n")
+}
+
+/// Strip single-line comments and blank lines from code to save tokens.
+/// Preserves JSDoc/docstrings on the first line only (they're often the function signature).
+fn strip_comments(code: &str, ext: &str) -> String {
+    let comment_prefix: &[&str] = match ext {
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "rs" | "go" | "c" | "cpp" | "h" => &["//"],
+        "py" | "pyi" => &["#"],
+        _ => return code.to_string(),
+    };
+    code.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() { return false; }
+            // Keep lines that start with code, not comments
+            !comment_prefix.iter().any(|p| trimmed.starts_with(p))
+                // But keep lines like `// ... +N more lines` (our own truncation markers)
+                || trimmed.starts_with("// ...")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extract a quoted module name from a JS/TS import or require line
+fn extract_quoted_module(line: &str) -> Option<&str> {
+    // Find first quote character
+    for quote in ['\'', '"'] {
+        if let Some(start) = line.find(quote) {
+            let rest = &line[start+1..];
+            if let Some(end) = rest.find(quote) {
+                return Some(&rest[..end]);
+            }
+        }
+    }
+    None
+}
+
+/// Extract short module names from import lines (e.g., "express", "mongoose", "react")
+fn extract_module_names(imports: &str, ext: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in imports.lines() {
+        let trimmed = line.trim();
+        let module = match ext {
+            "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => {
+                // import X from 'module' or require('module')
+                if let Some(m) = extract_quoted_module(trimmed) {
+                    m
+                } else { continue }
+            }
+            "py" | "pyi" => {
+                if trimmed.starts_with("from ") {
+                    trimmed[5..].split_whitespace().next().unwrap_or("")
+                } else if trimmed.starts_with("import ") {
+                    trimmed[7..].split(',').next().unwrap_or("").trim()
+                } else { continue }
+            }
+            "rs" => {
+                if trimmed.starts_with("use ") {
+                    trimmed[4..].split("::").next().unwrap_or("").trim_end_matches(';')
+                } else { continue }
+            }
+            "go" => {
+                if let Some(pos) = trimmed.find('"') {
+                    let rest = &trimmed[pos+1..];
+                    rest.split('"').next().unwrap_or("").rsplit('/').next().unwrap_or("")
+                } else { continue }
+            }
+            _ => continue,
+        };
+        // Take just the package name (strip path prefixes like ./ or ../)
+        let short = module.trim_start_matches("./").trim_start_matches("../").rsplit('/').next().unwrap_or(module);
+        if !short.is_empty() && seen.insert(short.to_string()) {
+            names.push(short.to_string());
+        }
+    }
+    names
 }
 
 fn is_import_line(line: &str, ext: &str) -> bool {
