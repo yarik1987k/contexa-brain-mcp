@@ -6,6 +6,12 @@ use crate::indexer::{file_walker, symbol_extractor, embedding_client};
 
 use super::types::*;
 
+fn truncate_sig(sig: &str, max_chars: usize) -> String {
+    if sig.len() <= max_chars { return sig.to_string(); }
+    let cut = sig[..max_chars].rfind(|c: char| c == ',' || c == ')').unwrap_or(max_chars);
+    format!("{}...", &sig[..cut])
+}
+
 /// Live scan fallback when no index exists.
 pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_budget: u32) -> Result<String> {
     let mut output = String::new();
@@ -61,10 +67,11 @@ pub fn search_live(project_path: &Path, query: &str, max_results: u32, token_bud
                 for sym in &symbols {
                     if crate::context::relevance_scorer::has_word_match(&sym.name.to_lowercase(), &query_lower) {
                         score += scoring::SEARCH_SUBSTRING_NAME_BONUS;
-                        if symbol_matches.len() < 5 {
+                        if symbol_matches.len() < 3 {
+                            let sig = truncate_sig(&sym.signature, 80);
                             symbol_matches.push(format!(
-                                "[{}] {} (L{}-L{}): {}",
-                                sym.kind, sym.name, sym.start_line, sym.end_line, sym.signature
+                                "[{}] {} L{}-{}: {}",
+                                sym.kind.short(), sym.name, sym.start_line, sym.end_line, sig
                             ));
                         }
                     }

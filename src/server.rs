@@ -31,7 +31,7 @@ pub struct GetFileContextParams {
     pub path: String,
     #[schemars(description = "Reading mode: 'full', 'summary', 'smart', or 'symbols' (default: summary). 'smart' mode uses the query to include full code for relevant functions and only signatures for the rest.")]
     pub mode: Option<String>,
-    #[schemars(description = "Max tokens to return (default: 3000)")]
+    #[schemars(description = "Max tokens to return (default: 2000)")]
     pub token_budget: Option<u32>,
     #[schemars(description = "Optional query/context for smart mode — helps select which functions to show in full")]
     pub query: Option<String>,
@@ -51,7 +51,7 @@ pub struct SearchCodebaseParams {
     pub query: String,
     #[schemars(description = "Max results to return (default: 10)")]
     pub max_results: Option<u32>,
-    #[schemars(description = "Max tokens to return (default: 4000)")]
+    #[schemars(description = "Max tokens to return (default: 3000)")]
     pub token_budget: Option<u32>,
 }
 
@@ -181,7 +181,7 @@ impl ContextBrainServer {
                 return Err("Path escapes project directory".to_string());
             }
             let mode = params.mode.unwrap_or_else(|| "summary".to_string());
-            let budget = params.token_budget.unwrap_or(3000).min(100_000);
+            let budget = params.token_budget.unwrap_or(1500).min(100_000);
             tools::get_file_context::read_file_context(&resolved, &mode, budget, params.query.as_deref())
                 .map_err(|e| format!("Failed to read file: {}", e))
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
@@ -211,8 +211,8 @@ impl ContextBrainServer {
     ) -> Result<CallToolResult, McpError> {
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let max = params.max_results.unwrap_or(10);
-            let budget = params.token_budget.unwrap_or(4000);
+            let max = params.max_results.unwrap_or(7);
+            let budget = params.token_budget.unwrap_or(2500);
             tools::search_codebase::search(&project_path, &params.query, max, budget)
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Search failed: {}", e), None))?;
@@ -272,6 +272,16 @@ impl ContextBrainServer {
             let force = params.force.unwrap_or(false);
             if !force && indexer::pipeline::is_indexed(&project_path) {
                 return Ok("Project already indexed. Use force=true to re-index.".to_string());
+            }
+            if force {
+                // Delete the DB entirely to avoid any corruption or FK constraint issues
+                let db_path = crate::db::schema::db_path(&project_path);
+                if db_path.exists() {
+                    let _ = std::fs::remove_file(&db_path);
+                    // Also remove WAL and SHM files if they exist
+                    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+                    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+                }
             }
             let stats = indexer::pipeline::index_project(&project_path)
                 .map_err(|e| format!("Indexing failed: {}", e))?;

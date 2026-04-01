@@ -110,15 +110,22 @@ pub fn recall(
         return Ok(output);
     }
 
-    writeln!(&mut output, "Found {} relevant memories:\n", scored.len())?;
+    writeln!(&mut output, "Memories:\n")?;
     for (score, row) in &scored {
+        let date = if row.created_at.len() >= 10 { &row.created_at[..10] } else { &row.created_at };
+        let display_content = if row.content.len() > 300 {
+            let cut = row.content[..300].rfind(' ').unwrap_or(300);
+            format!("{}...", &row.content[..cut])
+        } else {
+            row.content.clone()
+        };
         writeln!(
             &mut output,
             "- [{:.0}%] [{}] [{}] {}",
             score * 100.0,
-            row.created_at,
+            date,
             row.category,
-            row.content
+            display_content
         )?;
         if !row.tags.is_empty() {
             writeln!(&mut output, "  Tags: {}", row.tags)?;

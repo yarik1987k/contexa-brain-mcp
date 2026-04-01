@@ -56,12 +56,12 @@ pub(super) fn upsert_match(
         let entry = &mut matches[idx];
         entry.score += score_delta;
         if let Some(sym) = symbol_match {
-            if entry.symbol_matches.len() < 5 {
+            if entry.symbol_matches.len() < 3 {
                 entry.symbol_matches.push(sym);
             }
         }
         if let Some(ctx) = context_line {
-            if entry.context_lines.len() < 3 {
+            if entry.context_lines.len() < 1 {
                 entry.context_lines.push(ctx);
             }
         }
@@ -84,34 +84,34 @@ pub(super) fn upsert_match(
 pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget: u32, output: &mut String) -> Result<()> {
     // Warn user if semantic search is unavailable
     if !crate::indexer::embedding_client::is_model_available() {
-        writeln!(output, "**Warning:** Embedding model failed to load. Results use keyword matching only (no semantic search).\n")?;
+        writeln!(output, "Warning: No semantic search — keyword matching only.\n")?;
     }
 
     if matches.is_empty() {
-        writeln!(output, "No results found for: '{}'", query)?;
+        writeln!(output, "No results for '{}'", query)?;
         return Ok(());
     }
-
-    writeln!(output, "Found {} results for '{}':\n", matches.len(), query)?;
 
     let mut budget_used = token_estimator::estimate_tokens(output) as u32;
 
     for m in matches {
         let mut entry = String::new();
-        writeln!(&mut entry, "## {} (score: {:.1})", m.relative_path, m.score)?;
 
-        for sym in &m.symbol_matches {
-            writeln!(&mut entry, "  SYMBOL: {}", sym)?;
+        if !m.symbol_matches.is_empty() {
+            for sym in &m.symbol_matches {
+                writeln!(&mut entry, "{}: {}", m.relative_path, sym)?;
+            }
+        } else if !m.context_lines.is_empty() {
+            for ctx in &m.context_lines {
+                writeln!(&mut entry, "{} L{}: {}", m.relative_path, ctx.line_num, ctx.content.trim_start())?;
+            }
+        } else {
+            writeln!(&mut entry, "{}", m.relative_path)?;
         }
-
-        for ctx in &m.context_lines {
-            writeln!(&mut entry, "  L{}: {}", ctx.line_num, ctx.content)?;
-        }
-        writeln!(&mut entry)?;
 
         let entry_tokens = token_estimator::estimate_tokens(&entry) as u32;
         if budget_used + entry_tokens > token_budget {
-            writeln!(output, "... [TRUNCATED — token budget reached]")?;
+            writeln!(output, "... [TRUNCATED]")?;
             break;
         }
 

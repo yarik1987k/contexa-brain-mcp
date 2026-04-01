@@ -55,6 +55,45 @@ impl std::fmt::Display for SymbolKind {
     }
 }
 
+impl SymbolKind {
+    /// Compact abbreviation for token-efficient output formatting.
+    pub fn short(&self) -> &'static str {
+        match self {
+            SymbolKind::Function => "fn",
+            SymbolKind::AsyncFunction => "afn",
+            SymbolKind::Class => "cls",
+            SymbolKind::Method => "meth",
+            SymbolKind::Interface => "iface",
+            SymbolKind::TypeAlias => "type",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Struct => "struct",
+            SymbolKind::Trait => "trait",
+            SymbolKind::Impl => "impl",
+            SymbolKind::Export => "exp",
+            SymbolKind::Constant => "const",
+        }
+    }
+}
+
+/// Abbreviate a kind string (from DB) for compact output.
+pub fn abbreviate_kind(kind: &str) -> &str {
+    match kind {
+        "function" | "Function" => "fn",
+        "async function" | "AsyncFunction" => "afn",
+        "class" | "Class" => "cls",
+        "method" | "Method" => "meth",
+        "interface" | "Interface" => "iface",
+        "type" | "TypeAlias" => "type",
+        "enum" | "Enum" => "enum",
+        "struct" | "Struct" => "struct",
+        "trait" | "Trait" => "trait",
+        "impl" | "Impl" => "impl",
+        "export" | "Export" => "exp",
+        "const" | "Constant" => "const",
+        other => other,
+    }
+}
+
 // ── Data-driven extraction rules ─────────────────────────────────────
 
 /// A rule mapping a tree-sitter node kind to a symbol kind and name field.
@@ -162,6 +201,21 @@ pub fn extract_symbols(source: &str, extension: &str) -> Result<Vec<Symbol>> {
         "go" => extract_go_symbols(&root, source, &mut symbols),
         "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => extract_c_symbols(&root, source, &mut symbols),
         _ => {}
+    }
+
+    // Auto-expand large functions: extract inner symbols and add them to results.
+    // This ensures ALL consumers (summary, symbols, smart, indexer) see inner structure.
+    let large_funcs: Vec<(String, usize)> = symbols.iter()
+        .filter(|s| {
+            let span = s.end_line.saturating_sub(s.start_line) + 1;
+            span >= 200 && matches!(s.kind, SymbolKind::Function | SymbolKind::AsyncFunction)
+        })
+        .map(|s| (s.code.clone(), s.start_line))
+        .collect();
+
+    for (code, base_line) in large_funcs {
+        let inner = extract_inner_symbols_for_ext(&code, base_line, extension);
+        symbols.extend(inner);
     }
 
     Ok(symbols)
@@ -285,6 +339,17 @@ fn extract_variable_declarations(node: &Node, source: &str, symbols: &mut Vec<Sy
         if child.kind() == "variable_declarator" {
             if let Some(name_node) = child.child_by_field_name("name") {
                 if let Some(value_node) = child.child_by_field_name("value") {
+                    // Skip destructured imports: const { x } = require(...)
+                    // These are imports, not definitions — they pollute search results
+                    if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+                        if value_node.kind() == "call_expression" {
+                            let call_text = node_text(&value_node, source);
+                            if call_text.starts_with("require(") {
+                                continue; // Skip — this is an import
+                            }
+                        }
+                    }
+
                     let kind = match value_node.kind() {
                         "arrow_function" | "function" => SymbolKind::Function,
                         "class" => SymbolKind::Class,
@@ -464,13 +529,19 @@ fn find_c_function_name(node: &Node, source: &str) -> Option<String> {
 /// For large functions (200+ lines), extract inner structure using both
 /// tree-sitter AST walking and regex fallback for maximum coverage.
 /// Returns: hooks, named inner functions, handlers, and key declarations.
-pub fn extract_inner_symbols(code: &str, base_line: usize) -> Vec<Symbol> {
+pub fn extract_inner_symbols_for_ext(code: &str, base_line: usize, extension: &str) -> Vec<Symbol> {
     let mut inner = Vec::new();
     let mut seen_lines = std::collections::HashSet::new();
 
     // Phase 1: Try tree-sitter for accurate AST-based extraction
-    // Parse the function body as JS/TS to find nested declarations
-    if let Ok(language) = get_language("js") {
+    // Use the correct parser for the file's language (TSX needs TS parser, not JS)
+    let lang_key = match extension {
+        "tsx" => "tsx",
+        "ts" => "ts",
+        "jsx" => "js",
+        _ => "js",
+    };
+    if let Ok(language) = get_language(lang_key) {
         let mut parser = Parser::new();
         if parser.set_language(&language).is_ok() {
             if let Some(tree) = parser.parse(code, None) {

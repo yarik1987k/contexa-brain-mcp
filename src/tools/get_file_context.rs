@@ -5,6 +5,12 @@ use anyhow::{Result, bail};
 use crate::context::{token_estimator, file_summarizer};
 use crate::indexer::symbol_extractor;
 
+fn truncate_sig(sig: &str, max_chars: usize) -> String {
+    if sig.len() <= max_chars { return sig.to_string(); }
+    let cut = sig[..max_chars].rfind(|c: char| c == ',' || c == ')').unwrap_or(max_chars);
+    format!("{}...", &sig[..cut])
+}
+
 /// Read a file with smart token optimization based on mode.
 ///
 /// Modes:
@@ -75,10 +81,11 @@ fn read_symbols(content: &str, path: &Path) -> Result<String> {
         match symbol_extractor::extract_symbols(content, ext) {
             Ok(symbols) if !symbols.is_empty() => {
                 for sym in &symbols {
+                    let short_sig = truncate_sig(&sym.signature, 100);
                     writeln!(
                         &mut output,
-                        "L{}-L{} [{}] {}: {}",
-                        sym.start_line, sym.end_line, sym.kind, sym.name, sym.signature
+                        "L{}-{} [{}] {}: {}",
+                        sym.start_line, sym.end_line, sym.kind.short(), sym.name, short_sig
                     )?;
                 }
                 return Ok(output);

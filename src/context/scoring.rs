@@ -14,9 +14,12 @@ pub const SEARCH_SYMBOL_SIM_WEIGHT: f32 = 5.0;
 /// Minimum cosine similarity for file embedding to count.
 pub const SEARCH_FILE_SIM_THRESHOLD: f32 = 0.35;
 /// Multiplier applied to file embedding similarity score.
-pub const SEARCH_FILE_SIM_WEIGHT: f32 = 3.0;
+/// Reduced from 3.0 — file embeddings are too noisy for implementation queries
+/// (files that import a concept score similarly to files that implement it).
+pub const SEARCH_FILE_SIM_WEIGHT: f32 = 1.5;
 /// Bonus for file path matching the query.
-pub const SEARCH_PATH_MATCH_BONUS: f32 = 4.0;
+/// Increased from 4.0 — path match is the strongest signal for finding implementations.
+pub const SEARCH_PATH_MATCH_BONUS: f32 = 6.0;
 /// Maximum boost from import-centrality ranking.
 /// Reduced from 2.0 to avoid hub files (routes) outscoring leaf implementations.
 pub const SEARCH_CENTRALITY_MAX_BOOST: f32 = 0.5;
@@ -46,6 +49,10 @@ pub const FILE_SUMMARY_CHARS: usize = 500;
 
 /// Minimum remaining token budget before stopping symbol packing.
 pub const MIN_BUDGET_TOKENS: u32 = 20;
+
+/// Maximum lines of code body to include in smart summaries for high-relevance symbols.
+/// Symbols larger than this get truncated. Full code is still available via get_symbol.
+pub const MAX_BODY_LINES_IN_SUMMARY: usize = 30;
 
 /// Maximum memories stored per project.
 pub const MAX_MEMORIES: i64 = 1000;

@@ -6,6 +6,16 @@ use crate::context::{token_estimator, relevance_scorer, scoring};
 use crate::indexer::symbol_extractor::{self, Symbol};
 use crate::indexer::embedding_client;
 
+fn truncate_signature(sig: &str, max_chars: usize) -> String {
+    if sig.len() <= max_chars {
+        return sig.to_string();
+    }
+    let cut = sig[..max_chars]
+        .rfind(|c: char| c == ',' || c == ')')
+        .unwrap_or(max_chars);
+    format!("{}...", &sig[..cut])
+}
+
 /// Smart file summarization that returns only the most relevant parts within a token budget.
 ///
 /// Unlike the old summary mode (imports + all signatures), this:
@@ -22,11 +32,10 @@ pub fn smart_summarize(
     query: Option<&str>,
 ) -> Result<String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let line_count = content.lines().count();
     let mut output = String::new();
 
     // Header
-    writeln!(&mut output, "# {} ({} lines)\n", path.display(), line_count)?;
+    writeln!(&mut output, "# {}\n", path.display())?;
 
     // If no query or non-AST file, fall back to structural summary
     let has_ast = crate::indexer::config::has_ast_support(ext);
@@ -58,71 +67,73 @@ pub fn smart_summarize(
     // Sort by relevance (highest first)
     scored.sort_by(|a, b| relevance_scorer::cmp_score_desc(a.0, b.0));
 
-    // Always include imports (cheap, provides context)
+    // Always include imports (cheap, provides context) — cap at 5 lines
     let imports = extract_imports(content, ext);
     if !imports.is_empty() {
-        writeln!(&mut output, "## Imports\n{}\n", imports)?;
+        let import_lines: Vec<&str> = imports.lines().collect();
+        if import_lines.len() <= 5 {
+            writeln!(&mut output, "Imports:\n{}\n", imports)?;
+        } else {
+            let shown: String = import_lines[..5].join("\n");
+            writeln!(&mut output, "Imports:\n{}\n... +{} more\n", shown, import_lines.len() - 5)?;
+        }
     }
 
     let mut remaining_budget = token_budget.saturating_sub(token_estimator::estimate_tokens(&output) as u32);
 
     // Pack symbols into budget
-    let mut full_count = 0usize;
-    let mut sig_count = 0usize;
-
     for (score, sym) in &scored {
         if remaining_budget < scoring::MIN_BUDGET_TOKENS {
             break;
         }
 
-        let lines_span = sym.end_line.saturating_sub(sym.start_line) + 1;
-
         if *score > scoring::RELEVANCE_HIGH_THRESHOLD {
-            // High relevance: include full code body
-            let code_tokens = token_estimator::estimate_tokens(&sym.code) as u32;
+            // High relevance: include code body (truncated if large)
+            let lines_span = sym.end_line.saturating_sub(sym.start_line) + 1;
+            let code_to_show = if lines_span > scoring::MAX_BODY_LINES_IN_SUMMARY + 10 {
+                let truncated: String = sym.code.lines()
+                    .take(scoring::MAX_BODY_LINES_IN_SUMMARY)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{}\n// ... +{} more lines", truncated, lines_span - scoring::MAX_BODY_LINES_IN_SUMMARY)
+            } else {
+                sym.code.clone()
+            };
+            let code_tokens = token_estimator::estimate_tokens(&code_to_show) as u32;
 
             if code_tokens <= remaining_budget {
                 writeln!(
                     &mut output,
-                    "## [{}] {} (L{}-L{}, relevance: {:.0}%)\n```{}\n{}\n```\n",
-                    sym.kind, sym.name, sym.start_line, sym.end_line,
-                    score * 100.0, ext, sym.code
+                    "[{}] {} L{}-{}:\n```{}\n{}\n```\n",
+                    sym.kind.short(), sym.name, sym.start_line, sym.end_line,
+                    ext, code_to_show
                 )?;
                 remaining_budget = remaining_budget.saturating_sub(code_tokens + 10);
-                full_count += 1;
             } else {
                 // Code too large for budget — include signature only
                 let sig_line = format!(
-                    "- [{}] **{}** (L{}-L{}, {} lines): `{}`",
-                    sym.kind, sym.name, sym.start_line, sym.end_line, lines_span, sym.signature
+                    "[{}] {} L{}-{}: {}",
+                    sym.kind.short(), sym.name, sym.start_line, sym.end_line, truncate_signature(&sym.signature, 100)
                 );
                 let sig_tokens = token_estimator::estimate_tokens(&sig_line) as u32;
                 if sig_tokens <= remaining_budget {
                     writeln!(&mut output, "{}", sig_line)?;
                     remaining_budget = remaining_budget.saturating_sub(sig_tokens);
-                    sig_count += 1;
                 }
             }
         } else if *score > scoring::RELEVANCE_MEDIUM_THRESHOLD {
             // Medium relevance: signature only
             let sig_line = format!(
-                "- [{}] **{}** (L{}-L{}, {} lines): `{}`",
-                sym.kind, sym.name, sym.start_line, sym.end_line, lines_span, sym.signature
+                "- [{}] {} L{}-{}: {}",
+                sym.kind.short(), sym.name, sym.start_line, sym.end_line, truncate_signature(&sym.signature, 100)
             );
             let sig_tokens = token_estimator::estimate_tokens(&sig_line) as u32;
             if sig_tokens <= remaining_budget {
                 writeln!(&mut output, "{}", sig_line)?;
                 remaining_budget = remaining_budget.saturating_sub(sig_tokens);
-                sig_count += 1;
             }
         }
         // Low relevance (< 0.05): omit entirely
-    }
-
-    // Footer with stats
-    let omitted = symbols.len().saturating_sub(full_count + sig_count);
-    if omitted > 0 {
-        writeln!(&mut output, "\n_({} full, {} signatures, {} omitted as low-relevance)_", full_count, sig_count, omitted)?;
     }
 
     Ok(output)
@@ -140,10 +151,16 @@ fn structural_summary(
     let lines: Vec<&str> = content.lines().collect();
     let char_budget = token_estimator::tokens_to_chars(token_budget);
 
-    // Imports
+    // Imports (cap at 8 lines)
     let imports = extract_imports(content, ext);
     if !imports.is_empty() {
-        writeln!(output, "## Imports\n{}\n", imports)?;
+        let import_lines: Vec<&str> = imports.lines().collect();
+        if import_lines.len() <= 5 {
+            writeln!(output, "Imports:\n{}\n", imports)?;
+        } else {
+            let shown: String = import_lines[..5].join("\n");
+            writeln!(output, "Imports:\n{}\n... +{} more\n", shown, import_lines.len() - 5)?;
+        }
     }
 
     // Try AST symbols
@@ -152,26 +169,13 @@ fn structural_summary(
     if has_ast {
         if let Ok(symbols) = symbol_extractor::extract_symbols(content, ext) {
             if !symbols.is_empty() {
-                writeln!(output, "## Symbols ({} found)\n", symbols.len())?;
+                // Symbol list follows directly
                 for sym in &symbols {
-                    let span = sym.end_line.saturating_sub(sym.start_line) + 1;
                     writeln!(
                         output,
-                        "- [{}] **{}** (L{}-L{}, {} lines): `{}`",
-                        sym.kind, sym.name, sym.start_line, sym.end_line, span, sym.signature
+                        "[{}] {} L{}-{}: {}",
+                        sym.kind.short(), sym.name, sym.start_line, sym.end_line, truncate_signature(&sym.signature, 100)
                     )?;
-
-                    // For large functions (200+ lines), extract inner structure
-                    if span >= 200 && matches!(sym.kind, symbol_extractor::SymbolKind::Function
-                        | symbol_extractor::SymbolKind::AsyncFunction) {
-                        let inner = symbol_extractor::extract_inner_symbols(&sym.code, sym.start_line);
-                        if !inner.is_empty() {
-                            writeln!(output, "  Inner structure ({} items):", inner.len())?;
-                            for isym in &inner {
-                                writeln!(output, "  - L{}: `{}`", isym.start_line, isym.signature)?;
-                            }
-                        }
-                    }
 
                     if output.len() > char_budget {
                         writeln!(output, "\n... [TRUNCATED — budget reached]")?;

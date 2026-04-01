@@ -8,6 +8,12 @@ use crate::indexer::embedding_client;
 
 use super::types::*;
 
+fn truncate_sig(sig: &str, max_chars: usize) -> String {
+    if sig.len() <= max_chars { return sig.to_string(); }
+    let cut = sig[..max_chars].rfind(|c: char| c == ',' || c == ')').unwrap_or(max_chars);
+    format!("{}...", &sig[..cut])
+}
+
 /// Fast search using the pre-built index.
 pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_budget: u32) -> Result<String> {
     let conn = schema::open_db(project_path)?;
@@ -104,27 +110,31 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
 
             if score > 0.0 {
                 // Boost definitions, penalize import-only matches
-                let is_definition = matches!(row.kind.as_str(),
-                    "function" | "async function" | "Function" | "AsyncFunction"
-                    | "class" | "Class" | "method" | "Method"
-                    | "struct" | "Struct" | "trait" | "Trait"
-                    | "impl" | "Impl" | "enum" | "Enum"
-                    | "interface" | "Interface" | "type" | "TypeAlias"
-                    | "const" | "Constant");
+                let name_is_destructured = name_lower.starts_with('{') || name_lower.starts_with('[');
+                let sig_is_require = row.signature.contains("require(");
+
+                let is_definition = !name_is_destructured && !sig_is_require
+                    && matches!(row.kind.as_str(),
+                        "function" | "async function" | "Function" | "AsyncFunction"
+                        | "class" | "Class" | "method" | "Method"
+                        | "struct" | "Struct" | "trait" | "Trait"
+                        | "impl" | "Impl" | "enum" | "Enum"
+                        | "interface" | "Interface" | "type" | "TypeAlias");
+                let is_import_symbol = name_is_destructured || sig_is_require;
                 let is_export = row.kind == "export" || row.kind == "Export";
                 let is_small_export = is_export && (row.end_line - row.start_line) < 3;
 
                 if is_definition {
-                    // Definitions get a significant boost
                     score *= 1.5;
-                } else if is_small_export {
-                    // Small exports (re-exports / imports) get penalized
-                    score *= 0.3;
+                } else if is_import_symbol || is_small_export {
+                    score *= 0.2;
                 }
 
+                let sig = truncate_sig(&row.signature, 80);
                 let sym_line = format!(
-                    "[{}] {} (L{}-L{}): {}",
-                    row.kind, row.name, row.start_line, row.end_line, row.signature
+                    "[{}] {} L{}-{}: {}",
+                    crate::indexer::symbol_extractor::abbreviate_kind(&row.kind),
+                    row.name, row.start_line, row.end_line, sig
                 );
                 upsert_match(&mut matches, &mut match_index, &row.file_path, score, None, Some(sym_line));
             }
@@ -189,8 +199,8 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
             upsert_match(&mut matches, &mut match_index, path, scoring::SEARCH_PATH_MATCH_BONUS, None, None);
         }
 
-        // Also match individual query words against file paths
-        if query_words.len() > 1 {
+        // Also match individual query words against file paths (with prefix matching)
+        {
             let mut all_files_stmt = conn.prepare(
                 "SELECT relative_path FROM files"
             )?;
@@ -200,9 +210,13 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
 
             for file_path in &all_paths {
                 let path_lower = file_path.to_lowercase();
-                let matched = query_words.iter().filter(|w| path_lower.contains(*w)).count();
+                // Match words with prefix support: "authentication" matches "auth" in path
+                let matched = query_words.iter().filter(|w| {
+                    path_lower.contains(*w)
+                        || w.len() >= 4 && path_lower.contains(&w[..4]) // prefix match (4+ chars)
+                }).count();
                 if matched > 0 {
-                    let fraction = matched as f32 / query_words.len() as f32;
+                    let fraction = matched as f32 / query_words.len().max(1) as f32;
                     upsert_match(&mut matches, &mut match_index, file_path, fraction * scoring::SEARCH_PATH_MATCH_BONUS, None, None);
                 }
             }
@@ -229,45 +243,71 @@ pub fn search_indexed(project_path: &Path, query: &str, max_results: u32, token_
         }
     }
 
-    // For top matches, add keyword context lines from actual files
+    // 5. Post-scoring: check if query words appear in implementation code vs only in imports.
+    // Files where query terms only appear in import/require lines are consumers, not implementations.
+    // Read a wider set of candidates before truncating so we can re-rank.
     matches.sort_by(|a, b| crate::context::relevance_scorer::cmp_score_desc(a.score, b.score));
-    matches.truncate(max_results as usize);
+    let analysis_count = (max_results as usize * 3).min(matches.len()); // analyze top 3x candidates
 
-    for m in &mut matches {
-        if m.context_lines.is_empty() {
-            let file_path = project_path.join(&m.relative_path);
-            if let Ok(content) = std::fs::read_to_string(&file_path) {
-                // Collect all matching lines, then prefer definitions over imports
-                let mut def_lines: Vec<ContextLine> = Vec::new();
-                let mut other_lines: Vec<ContextLine> = Vec::new();
+    for m in matches.iter_mut().take(analysis_count) {
+        let file_path = project_path.join(&m.relative_path);
+        if let Ok(content) = std::fs::read_to_string(&file_path) {
+            let mut def_lines: Vec<ContextLine> = Vec::new();
+            let mut import_lines: Vec<ContextLine> = Vec::new();
+            let mut def_count = 0u32;
+            let mut import_count = 0u32;
 
-                for (i, line) in content.lines().enumerate() {
-                    let line_lower = line.to_lowercase();
-                    let matches_query = line_lower.contains(&query_lower)
-                        || query_words.iter().any(|w| line_lower.contains(*w));
+            for (i, line) in content.lines().enumerate() {
+                let line_lower = line.to_lowercase();
+                // Use prefix matching too: "auth" matches "authentication"
+                let matches_query = query_words.iter().any(|w| {
+                    line_lower.contains(*w)
+                        || (w.len() >= 4 && line_lower.contains(&w[..4]))
+                });
 
-                    if matches_query {
-                        let trimmed = line.trim();
-                        let is_import = trimmed.starts_with("import ")
-                            || trimmed.starts_with("const {") && trimmed.contains("require(")
-                            || trimmed.starts_with("from ")
-                            || trimmed.starts_with("#include");
-                        let ctx = ContextLine { line_num: i + 1, content: trimmed.to_string() };
-                        if is_import {
-                            other_lines.push(ctx);
-                        } else {
-                            def_lines.push(ctx);
+                if matches_query {
+                    let trimmed = line.trim();
+                    let is_import = trimmed.starts_with("import ")
+                        || (trimmed.starts_with("const {") && trimmed.contains("require("))
+                        || (trimmed.starts_with("const ") && trimmed.contains("require(") && trimmed.contains('}'))
+                        || trimmed.starts_with("from ")
+                        || trimmed.starts_with("#include");
+
+                    if is_import {
+                        import_count += 1;
+                        if import_lines.len() < 1 {
+                            import_lines.push(ContextLine { line_num: i + 1, content: trimmed.to_string() });
+                        }
+                    } else {
+                        def_count += 1;
+                        if def_lines.len() < 1 {
+                            def_lines.push(ContextLine { line_num: i + 1, content: trimmed.to_string() });
                         }
                     }
                 }
+            }
 
-                // Prefer definition lines, fill remaining slots with import lines
-                for ctx in def_lines.into_iter().chain(other_lines.into_iter()).take(3) {
+            // Adjust score based on definition-vs-import ratio
+            if def_count == 0 && import_count > 0 {
+                // File only references query terms in imports — likely a consumer
+                m.score *= 0.4;
+            } else if def_count > 0 && import_count == 0 {
+                // File uses query terms in actual code, not imports — likely an implementation
+                m.score *= 1.3;
+            }
+
+            // Set context lines: prefer definitions
+            if m.context_lines.is_empty() {
+                for ctx in def_lines.into_iter().chain(import_lines.into_iter()).take(1) {
                     m.context_lines.push(ctx);
                 }
             }
         }
     }
+
+    // Re-sort after score adjustments and truncate to final count
+    matches.sort_by(|a, b| crate::context::relevance_scorer::cmp_score_desc(a.score, b.score));
+    matches.truncate(max_results as usize);
 
     format_results(&matches, query, token_budget, &mut output)?;
     Ok(output)

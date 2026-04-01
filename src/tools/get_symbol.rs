@@ -4,6 +4,12 @@ use anyhow::{Result, bail};
 
 use crate::db::schema;
 
+fn truncate_sig(sig: &str, max_chars: usize) -> String {
+    if sig.len() <= max_chars { return sig.to_string(); }
+    let cut = sig[..max_chars].rfind(|c: char| c == ',' || c == ')').unwrap_or(max_chars);
+    format!("{}...", &sig[..cut])
+}
+
 /// Get a specific symbol (function/class/struct) by name.
 /// Returns the exact code block from the source file.
 pub fn get_symbol(project_path: &Path, name: &str, file_hint: Option<&str>) -> Result<String> {
@@ -66,7 +72,7 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE LOWER(s.name) LIKE ?1
              ORDER BY f.relative_path, s.start_line
-             LIMIT 10",
+             LIMIT 5",
         )?;
         let pattern = format!("%{}%", name_lower);
         let fuzzy: Vec<(String, String, i64, i64, String, String)> = fuzzy_stmt
@@ -80,9 +86,12 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
             return Ok(String::new());
         }
 
-        writeln!(&mut output, "No exact match for '{}'. Similar symbols:\n", name)?;
+        writeln!(&mut output, "No exact match for '{}'. Similar:\n", name)?;
         for (sname, kind, start, end, sig, path) in &fuzzy {
-            writeln!(&mut output, "- [{}] {} in {} (L{}-L{}): {}", kind, sname, path, start, end, sig)?;
+            let short_sig = truncate_sig(sig, 80);
+            writeln!(&mut output, "- [{}] {} in {} L{}-{}: {}",
+                crate::indexer::symbol_extractor::abbreviate_kind(kind),
+                sname, path, start, end, short_sig)?;
         }
         return Ok(output);
     }
@@ -133,18 +142,17 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
             bail!("Path escapes project directory: {}", rel_path);
         }
         let file_path = resolved;
-        writeln!(&mut output, "## [{}] {} in {} (L{}-L{})\n", kind, sname, rel_path, start_line, end_line)?;
+        writeln!(&mut output, "▸ [{}] {} in {} L{}-{}\n",
+            crate::indexer::symbol_extractor::abbreviate_kind(kind),
+            sname, rel_path, start_line, end_line)?;
 
         if let Ok(content) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = content.lines().collect();
             let start = ((*start_line).max(0) as usize).saturating_sub(1);
             let end = ((*end_line).max(0) as usize).min(lines.len());
 
-            // Include 2 lines of context before
-            let ctx_start = start.saturating_sub(2);
-            for i in ctx_start..end {
-                let prefix = if i < start { "  // " } else { "" };
-                writeln!(&mut output, "{}L{}: {}", prefix, i + 1, lines.get(i).unwrap_or(&""))?;
+            for i in start..end {
+                writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
             }
         }
         writeln!(&mut output)?;
@@ -186,18 +194,16 @@ fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
                 {
                     writeln!(
                         &mut output,
-                        "## [{}] {} in {} (L{}-L{})\n",
-                        sym.kind, sym.name, file.relative_path, sym.start_line, sym.end_line
+                        "▸ [{}] {} in {} L{}-{}\n",
+                        sym.kind.short(), sym.name, file.relative_path, sym.start_line, sym.end_line
                     )?;
 
                     let lines: Vec<&str> = content.lines().collect();
                     let start = sym.start_line.saturating_sub(1);
                     let end = sym.end_line.min(lines.len());
-                    let ctx_start = start.saturating_sub(2);
 
-                    for i in ctx_start..end {
-                        let prefix = if i < start { "  // " } else { "" };
-                        writeln!(&mut output, "{}L{}: {}", prefix, i + 1, lines.get(i).unwrap_or(&""))?;
+                    for i in start..end {
+                        writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
                     }
                     writeln!(&mut output)?;
                 }
@@ -259,14 +265,12 @@ fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
 
                 writeln!(
                     &mut output,
-                    "## [grep match] {} in {} (L{}-L{})\n",
+                    "▸ [match] {} in {} L{}-{}\n",
                     name, file.relative_path, def_idx + 1, func_end + 1
                 )?;
 
-                let ctx_start = def_idx.saturating_sub(2);
-                for i in ctx_start..=func_end.min(lines.len() - 1) {
-                    let prefix = if i < def_idx { "  // " } else { "" };
-                    writeln!(&mut output, "{}L{}: {}", prefix, i + 1, lines[i])?;
+                for i in def_idx..=func_end.min(lines.len() - 1) {
+                    writeln!(&mut output, "{}", lines[i])?;
                 }
                 writeln!(&mut output)?;
                 break; // Found it
