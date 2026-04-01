@@ -29,20 +29,22 @@ pub struct ListFilesParams {
 pub struct GetFileContextParams {
     #[schemars(description = "Relative file path from project root")]
     pub path: String,
-    #[schemars(description = "Reading mode: 'full', 'summary', 'smart', or 'symbols' (default: summary). 'smart' mode uses the query to include full code for relevant functions and only signatures for the rest.")]
+    #[schemars(description = "Mode: 'summary', 'smart', 'symbols', 'full' (default: summary)")]
     pub mode: Option<String>,
-    #[schemars(description = "Max tokens to return (default: 2000)")]
+    #[schemars(description = "Max tokens (default: 1500)")]
     pub token_budget: Option<u32>,
-    #[schemars(description = "Optional query/context for smart mode — helps select which functions to show in full")]
+    #[schemars(description = "Query for smart mode relevance filtering")]
     pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetSymbolParams {
-    #[schemars(description = "Symbol name to look up (function, class, struct, etc.)")]
+    #[schemars(description = "Symbol name (function, class, struct, etc.)")]
     pub name: String,
-    #[schemars(description = "Optional file path hint to narrow the search")]
+    #[schemars(description = "File path hint to narrow search")]
     pub file: Option<String>,
+    #[schemars(description = "Max lines of code to return per symbol (default: 50). Pass 0 for unlimited.")]
+    pub max_lines: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -61,25 +63,25 @@ pub struct SearchCodebaseParams {
 pub struct SaveMemoryParams {
     #[schemars(description = "The content to remember")]
     pub content: String,
-    #[schemars(description = "Category: 'decision', 'architecture', 'task', 'bug', 'todo' (default: general)")]
+    #[schemars(description = "Category (default: general)")]
     pub category: Option<String>,
-    #[schemars(description = "Optional tags for retrieval (comma-separated)")]
+    #[schemars(description = "Tags, comma-separated")]
     pub tags: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecallMemoryParams {
-    #[schemars(description = "What to recall, e.g. 'what did we decide about the database?'")]
+    #[schemars(description = "Recall query")]
     pub query: String,
-    #[schemars(description = "Filter by category: 'decision', 'architecture', 'task', 'bug', 'todo'")]
+    #[schemars(description = "Filter by category")]
     pub category: Option<String>,
-    #[schemars(description = "Max memories to return (default: 5)")]
+    #[schemars(description = "Max results (default: 5)")]
     pub max_results: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct IndexProjectParams {
-    #[schemars(description = "Force re-index even if already indexed (default: false)")]
+    #[schemars(description = "Force full re-index")]
     pub force: Option<bool>,
 }
 
@@ -128,7 +130,7 @@ impl ContextBrainServer {
         }
     }
 
-    #[tool(description = "List files in the project directory tree with metadata. Respects .gitignore.")]
+    #[tool(description = "List project files. Respects .gitignore.")]
     async fn list_files(
         &self,
         Parameters(params): Parameters<ListFilesParams>,
@@ -155,7 +157,7 @@ impl ContextBrainServer {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Read a file with smart token optimization. Modes: 'full' (entire file), 'summary' (imports + AST signatures), 'smart' (query-aware: full code for relevant functions, signatures for rest — best for targeted work), 'symbols' (compact symbol list). Use 'smart' with a query for maximum token savings.")]
+    #[tool(description = "Read file context. Modes: 'summary' (signatures), 'smart' (query-aware: full code for relevant functions), 'symbols' (compact list), 'full'.")]
     async fn get_file_context(
         &self,
         Parameters(params): Parameters<GetFileContextParams>,
@@ -192,21 +194,22 @@ impl ContextBrainServer {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Get a specific function, class, or symbol by name. Returns the exact code block — the most token-efficient way to get specific code.")]
+    #[tool(description = "Get symbol code by name. Returns exact code block, truncated to max_lines (default 50).")]
     async fn get_symbol(
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<CallToolResult, McpError> {
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
-            tools::get_symbol::get_symbol(&project_path, &params.name, params.file.as_deref())
+            let max_lines = params.max_lines.unwrap_or(50);
+            tools::get_symbol::get_symbol(&project_path, &params.name, params.file.as_deref(), max_lines)
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Failed to get symbol: {}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Search the codebase using semantic similarity + keyword matching. Returns relevant code snippets ranked by relevance within a token budget.")]
+    #[tool(description = "Search codebase by semantic similarity + keywords. Use detail='pointers' (default, minimal), 'signatures', or 'code'.")]
     async fn search_codebase(
         &self,
         Parameters(params): Parameters<SearchCodebaseParams>,
@@ -223,7 +226,7 @@ impl ContextBrainServer {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Save a decision, architectural insight, or task context to persistent memory. This memory persists across Cursor sessions and is searchable semantically.")]
+    #[tool(description = "Save context to persistent cross-session memory (searchable semantically).")]
     async fn save_memory(
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
@@ -239,7 +242,7 @@ impl ContextBrainServer {
         Ok(CallToolResult::success(vec![Content::text("Memory saved successfully.")]))
     }
 
-    #[tool(description = "Recall past decisions, context, and insights from persistent memory. Uses semantic similarity to find relevant memories even with different wording.")]
+    #[tool(description = "Recall from persistent memory using semantic search.")]
     async fn recall_memory(
         &self,
         Parameters(params): Parameters<RecallMemoryParams>,
@@ -254,7 +257,7 @@ impl ContextBrainServer {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Get a condensed project architecture overview (~500 tokens). Reads README/ARCHITECTURE.md plus dynamic file stats and tech stack detection.")]
+    #[tool(description = "Condensed project architecture: file stats, tech stack, README skeleton.")]
     async fn get_architecture(&self) -> Result<CallToolResult, McpError> {
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -265,7 +268,7 @@ impl ContextBrainServer {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Index the project codebase: extract symbols via AST, generate embeddings for semantic search, and store in local database. Run this once for fast future searches.")]
+    #[tool(description = "Index codebase for fast semantic search. Run once, auto-updates on file changes.")]
     async fn index_project(
         &self,
         Parameters(params): Parameters<IndexProjectParams>,

@@ -12,24 +12,22 @@ fn truncate_sig(sig: &str, max_chars: usize) -> String {
 
 /// Get a specific symbol (function/class/struct) by name.
 /// Returns the exact code block from the source file.
-pub fn get_symbol(project_path: &Path, name: &str, file_hint: Option<&str>) -> Result<String> {
+pub fn get_symbol(project_path: &Path, name: &str, file_hint: Option<&str>, max_lines: usize) -> Result<String> {
     let db_path = schema::db_path(project_path);
 
     // Try indexed database first
     if db_path.exists() {
-        if let Ok(result) = get_from_index(project_path, name, file_hint) {
-            // Only accept index results if they contain actual code (not just "Similar symbols" suggestions)
+        if let Ok(result) = get_from_index(project_path, name, file_hint, max_lines) {
             if !result.is_empty() && !result.starts_with("No exact match") {
                 return Ok(result);
             }
         }
     }
 
-    // Fallback: grep-like search through files — catches patterns the AST index missed
-    get_from_files(project_path, name, file_hint)
+    get_from_files(project_path, name, file_hint, max_lines)
 }
 
-fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> Result<String> {
+fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>, max_lines: usize) -> Result<String> {
     let conn = schema::open_db(project_path)?;
     let mut output = String::new();
 
@@ -142,7 +140,7 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
             bail!("Path escapes project directory: {}", rel_path);
         }
         let file_path = resolved;
-        writeln!(&mut output, "▸ [{}] {} in {} L{}-{}\n",
+        writeln!(&mut output, "[{}] {} in {} L{}-{}",
             crate::indexer::symbol_extractor::abbreviate_kind(kind),
             sname, rel_path, start_line, end_line)?;
 
@@ -150,9 +148,17 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
             let lines: Vec<&str> = content.lines().collect();
             let start = ((*start_line).max(0) as usize).saturating_sub(1);
             let end = ((*end_line).max(0) as usize).min(lines.len());
+            let total_lines = end - start;
 
-            for i in start..end {
-                writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
+            if max_lines > 0 && total_lines > max_lines {
+                for i in start..(start + max_lines) {
+                    writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
+                }
+                writeln!(&mut output, "// ... +{} more lines (pass max_lines=0 for full)", total_lines - max_lines)?;
+            } else {
+                for i in start..end {
+                    writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
+                }
             }
         }
         writeln!(&mut output)?;
@@ -161,7 +167,7 @@ fn get_from_index(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
     Ok(output)
 }
 
-fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>) -> Result<String> {
+fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>, max_lines: usize) -> Result<String> {
     use crate::indexer::{file_walker, symbol_extractor};
 
     let files = file_walker::walk_project(project_path)?;
@@ -194,16 +200,24 @@ fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
                 {
                     writeln!(
                         &mut output,
-                        "▸ [{}] {} in {} L{}-{}\n",
+                        "[{}] {} in {} L{}-{}",
                         sym.kind.short(), sym.name, file.relative_path, sym.start_line, sym.end_line
                     )?;
 
                     let lines: Vec<&str> = content.lines().collect();
                     let start = sym.start_line.saturating_sub(1);
                     let end = sym.end_line.min(lines.len());
+                    let total = end - start;
 
-                    for i in start..end {
-                        writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
+                    if max_lines > 0 && total > max_lines {
+                        for i in start..(start + max_lines) {
+                            writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
+                        }
+                        writeln!(&mut output, "// ... +{} more lines (pass max_lines=0 for full)", total - max_lines)?;
+                    } else {
+                        for i in start..end {
+                            writeln!(&mut output, "{}", lines.get(i).unwrap_or(&""))?;
+                        }
                     }
                     writeln!(&mut output)?;
                 }
@@ -265,12 +279,20 @@ fn get_from_files(project_path: &Path, name: &str, file_hint: Option<&str>) -> R
 
                 writeln!(
                     &mut output,
-                    "▸ [match] {} in {} L{}-{}\n",
+                    "[match] {} in {} L{}-{}",
                     name, file.relative_path, def_idx + 1, func_end + 1
                 )?;
 
-                for i in def_idx..=func_end.min(lines.len() - 1) {
-                    writeln!(&mut output, "{}", lines[i])?;
+                let total = func_end - def_idx + 1;
+                if max_lines > 0 && total > max_lines {
+                    for i in def_idx..(def_idx + max_lines).min(lines.len()) {
+                        writeln!(&mut output, "{}", lines[i])?;
+                    }
+                    writeln!(&mut output, "// ... +{} more lines (pass max_lines=0 for full)", total - max_lines)?;
+                } else {
+                    for i in def_idx..=func_end.min(lines.len() - 1) {
+                        writeln!(&mut output, "{}", lines[i])?;
+                    }
                 }
                 writeln!(&mut output)?;
                 break; // Found it

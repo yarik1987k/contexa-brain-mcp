@@ -102,51 +102,56 @@ pub(super) fn format_results(matches: &[SearchMatch], query: &str, token_budget:
     }
 
     let mut budget_used = token_estimator::estimate_tokens(output) as u32;
+    let mut last_dir = String::new();
 
     for m in matches {
         let mut entry = String::new();
 
+        // Extract directory for path grouping
+        let dir = m.relative_path.rfind('/').map(|i| &m.relative_path[..i+1]).unwrap_or("");
+        let file_part = m.relative_path.rfind('/').map(|i| &m.relative_path[i+1..]).unwrap_or(&m.relative_path);
+        let use_short = dir == last_dir && !dir.is_empty();
+        let display_path = if use_short { format!("  {}", file_part) } else { m.relative_path.clone() };
+        if !dir.is_empty() { last_dir = dir.to_string(); }
+
         match detail {
             "pointers" => {
-                // Minimal: file + name + line only
                 if !m.symbol_pointers.is_empty() {
                     for (name, kind, line) in &m.symbol_pointers {
-                        writeln!(&mut entry, "{} L{} [{}] {}", m.relative_path, line, kind, name)?;
+                        writeln!(&mut entry, "{} L{} [{}] {}", display_path, line, kind, name)?;
                     }
                 } else if !m.context_lines.is_empty() {
-                    writeln!(&mut entry, "{} L{}", m.relative_path, m.context_lines[0].line_num)?;
+                    writeln!(&mut entry, "{} L{}", display_path, m.context_lines[0].line_num)?;
                 } else {
-                    writeln!(&mut entry, "{}", m.relative_path)?;
+                    writeln!(&mut entry, "{}", display_path)?;
                 }
             }
             "code" => {
-                // Full: include signatures + context lines
                 if !m.symbol_matches.is_empty() {
                     for sym in &m.symbol_matches {
-                        writeln!(&mut entry, "{}: {}", m.relative_path, sym)?;
+                        writeln!(&mut entry, "{}: {}", display_path, sym)?;
                     }
                 }
                 if !m.context_lines.is_empty() {
                     for ctx in &m.context_lines {
-                        writeln!(&mut entry, "{} L{}: {}", m.relative_path, ctx.line_num, ctx.content.trim_start())?;
+                        writeln!(&mut entry, "{} L{}: {}", display_path, ctx.line_num, ctx.content.trim_start())?;
                     }
                 }
                 if m.symbol_matches.is_empty() && m.context_lines.is_empty() {
-                    writeln!(&mut entry, "{}", m.relative_path)?;
+                    writeln!(&mut entry, "{}", display_path)?;
                 }
             }
             _ => {
-                // "signatures" — current behavior (default fallback)
                 if !m.symbol_matches.is_empty() {
                     for sym in &m.symbol_matches {
-                        writeln!(&mut entry, "{}: {}", m.relative_path, sym)?;
+                        writeln!(&mut entry, "{}: {}", display_path, sym)?;
                     }
                 } else if !m.context_lines.is_empty() {
                     for ctx in &m.context_lines {
-                        writeln!(&mut entry, "{} L{}: {}", m.relative_path, ctx.line_num, ctx.content.trim_start())?;
+                        writeln!(&mut entry, "{} L{}: {}", display_path, ctx.line_num, ctx.content.trim_start())?;
                     }
                 } else {
-                    writeln!(&mut entry, "{}", m.relative_path)?;
+                    writeln!(&mut entry, "{}", display_path)?;
                 }
             }
         }
