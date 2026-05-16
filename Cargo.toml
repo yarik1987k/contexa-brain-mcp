@@ -47,6 +47,9 @@ tree-sitter-cpp = "0.23"
 # Embeddings (local, zero setup)
 fastembed = "4"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = true
