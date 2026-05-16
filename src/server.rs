@@ -14,6 +14,9 @@ use serde::Deserialize;
 use crate::tools;
 use crate::memory;
 use crate::indexer;
+use crate::telemetry;
+
+use std::time::Instant;
 
 // ── Parameter structs ─────────────────────────────────────────────────
 
@@ -94,6 +97,25 @@ pub struct ContextBrainServer {
     _watcher: Option<Arc<indexer::watch_manager::WatchManager>>,
 }
 
+impl ContextBrainServer {
+    /// Record one tool call (best-effort, never blocks the reply).
+    /// Heuristic empty-detection: search/recall print a "No ..." line on no
+    /// matches; everything else just contributes latency + call count.
+    fn record(&self, tool: &str, query: Option<&str>, output: &str, start: Instant) {
+        let latency_ms = start.elapsed().as_millis() as i64;
+        let trimmed = output.trim_start();
+        let result_count = if trimmed.starts_with("No results")
+            || trimmed.starts_with("No relevant memories")
+            || trimmed.starts_with("No memories")
+        {
+            Some(0)
+        } else {
+            None
+        };
+        telemetry::record_tool_call(&self.project_path, tool, query, result_count, latency_ms);
+    }
+}
+
 #[tool_router]
 impl ContextBrainServer {
     pub fn new(project_path: PathBuf) -> Self {
@@ -135,6 +157,7 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let base = match &params.path {
@@ -154,6 +177,7 @@ impl ContextBrainServer {
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(e, None))?;
 
+        self.record("list_files", None, &result, start);
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
@@ -162,6 +186,8 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<GetFileContextParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
+        let query_for_telemetry = params.query.clone();
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
             // Fix path duplication: if Claude passes "project-name/src/foo.js" but the project root is
@@ -191,6 +217,7 @@ impl ContextBrainServer {
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(e, None))?;
 
+        self.record("get_file_context", query_for_telemetry.as_deref(), &result, start);
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
@@ -199,6 +226,8 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
+        let name_for_telemetry = params.name.clone();
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             let max_lines = params.max_lines.unwrap_or(30);
@@ -206,6 +235,7 @@ impl ContextBrainServer {
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Failed to get symbol: {}", e), None))?;
 
+        self.record("get_symbol", Some(&name_for_telemetry), &result, start);
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
@@ -214,6 +244,8 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<SearchCodebaseParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
+        let query_for_telemetry = params.query.clone();
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             let max = params.max_results.unwrap_or(5);
@@ -223,23 +255,34 @@ impl ContextBrainServer {
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Search failed: {}", e), None))?;
 
+        self.record("search_codebase", Some(&query_for_telemetry), &result, start);
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(description = "Save context to persistent cross-session memory (searchable semantically).")]
+    #[tool(description = "Save context to persistent cross-session memory (searchable semantically). Near-duplicates merge automatically; cross-category duplicates link.")]
     async fn save_memory(
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         let project_path = self.project_path.clone();
-        tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             let cat = params.category.unwrap_or_else(|| "general".to_string());
             let tags = params.tags.unwrap_or_default();
             memory::store::save(&project_path, &params.content, &cat, &tags)
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Failed to save memory: {}", e), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text("Memory saved successfully.")]))
+        let msg = match outcome {
+            memory::store::SaveOutcome::Inserted(id) => format!("Memory saved (id {}).", id),
+            memory::store::SaveOutcome::Merged(id) => format!("Near-duplicate detected — merged into existing memory id {}.", id),
+            memory::store::SaveOutcome::Linked { new_id, peer_id } => format!(
+                "Cross-category duplicate of memory id {} — saved as id {} with link.",
+                peer_id, new_id
+            ),
+        };
+        self.record("save_memory", None, &msg, start);
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(description = "Recall from persistent memory using semantic search.")]
@@ -247,6 +290,8 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<RecallMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
+        let query_for_telemetry = params.query.clone();
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             let max = params.max_results.unwrap_or(5);
@@ -254,17 +299,20 @@ impl ContextBrainServer {
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Failed to recall: {}", e), None))?;
 
+        self.record("recall_memory", Some(&query_for_telemetry), &result, start);
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
     #[tool(description = "Condensed project architecture: file stats, tech stack, README skeleton.")]
     async fn get_architecture(&self) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             tools::get_architecture::build_overview(&project_path)
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(format!("Failed to build overview: {}", e), None))?;
 
+        self.record("get_architecture", None, &result, start);
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
@@ -273,6 +321,7 @@ impl ContextBrainServer {
         &self,
         Parameters(params): Parameters<IndexProjectParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         let project_path = self.project_path.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
             let force = params.force.unwrap_or(false);
@@ -295,6 +344,7 @@ impl ContextBrainServer {
         }).await.map_err(|e| McpError::internal_error(format!("Task failed: {}", e), None))?
           .map_err(|e| McpError::internal_error(e, None))?;
 
+        self.record("index_project", None, &result, start);
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 }
@@ -311,10 +361,14 @@ impl ServerHandler for ContextBrainServer {
             Implementation::new("context-brain", env!("CARGO_PKG_VERSION"))
         )
         .with_instructions(
-            "Context Brain is an intelligent context manager that saves tokens and remembers context. \
-             Tools: search_codebase (semantic + keyword search), get_file_context (smart file reading), \
-             get_symbol (extract specific function/class by name), save_memory/recall_memory (persistent cross-session memory), \
-             get_architecture (project overview), list_files (directory tree), index_project (build search index).".to_string()
+            "context-brain is a local-first MCP server that cuts your token bills. \
+             Instead of reading full files, prefer these tools: \
+             search_codebase (semantic + keyword search with ranked results), \
+             get_file_context (mode='summary'/'smart' returns slices, not whole files), \
+             get_symbol (extract a specific function/class by name), \
+             save_memory and recall_memory (persistent cross-session memory for decisions and conventions), \
+             get_architecture (~500-token project overview), list_files (directory tree), \
+             index_project (build or refresh the search index). All processing is local — no outbound API calls.".to_string()
         )
     }
 }

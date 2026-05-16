@@ -1,34 +1,63 @@
-# Context Brain
+# context-brain
 
-Intelligent MCP context manager for AI coding assistants. Sits between your IDE and Claude/GPT to reduce token usage and remember context across sessions.
+**Local-first MCP server that gives AI coding agents faster, more focused codebase retrieval. ~35% faster agent loops, big savings on multi-file research. Runs locally, zero API calls.**
 
-**~5,200 lines of Rust** | **34 tests** | **0 unsafe code** | **0 compiler warnings**
+A drop-in MCP server that sits between your editor (Cursor, Claude Code, anything MCP-compatible) and the LLM. Instead of pasting whole files into prompts, the LLM asks context-brain for the *exact* slice it needs — function signatures, query-relevant code, semantic search, persistent memory across sessions.
 
-## What It Does
+| Without context-brain | With context-brain |
+|---|---|
+| Dump 500-line file = ~6,000 tokens | Smart-mode slice = ~600 tokens (per tool call) |
+| LLM re-learns project every session | `save_memory` / `recall_memory` persist decisions |
+| Provider sees your code | All embeddings + storage stay on your machine |
+
+> **Honest scope.** Aggregate token savings are highly task-dependent. Internal benchmark on a 636-file project (10 agent tasks × 2 modes × 2 models): **multi-file research tasks** show 50–70% token reduction; **single-file lookups** can use *more* tokens than native `Read`. The robust wins across the board are **~35% faster wall-time**, **~40% fewer agent turns**, and **no network egress**.
+
+**Trade-off.** Slower first index (one-time, ~30s for a 1k-file project). 90MB local embedding model. No magic — well-tuned heuristics over AST extraction, semantic search, and SQLite.
+
+**~5,200 lines of Rust** | **44 tests** | **0 unsafe code** | **0 compiler warnings**
+
+## What it does
 
 - **Smart file reading** — AST-based symbol extraction sends signatures instead of full files; query-aware mode includes full code only for relevant functions
-- **Semantic search** — local embeddings (multilingual-e5-small, supports Hebrew and 100+ languages) combined with keyword matching, word-boundary awareness, and import-centrality ranking
-- **Persistent memory** — saves decisions across sessions with semantic recall (cosine similarity + keyword + recency scoring)
-- **File watching** — debounced filesystem watcher automatically re-indexes changed files in the background via incremental indexing
-- **Import-centrality ranking** — files imported by many others are boosted in search results
+- **Local semantic search** — multilingual-e5-small embeddings (100+ languages, Hebrew included) combined with keyword matching, word-boundary awareness, and import-centrality ranking
+- **Cross-session memory** — saves decisions with semantic recall (cosine similarity + keyword + recency scoring)
+- **File watching** — debounced filesystem watcher re-indexes changed files in the background
 - **Works with** Cursor, Claude Code, and any MCP-compatible editor
 
-## Quick Setup
+## Install
 
-### 1. Build from source
+### Option 1 — curl-pipe-sh (macOS, Linux)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/yarik1987k/contexa-brain-mcp/main/install.sh | sh
+```
+
+Auto-detects OS + arch, downloads the matching prebuilt binary, verifies its SHA-256, and installs to `/usr/local/bin` (or `~/.local/bin` if that's not writable).
+
+### Option 2 — Homebrew (macOS)
+
+Once the [`homebrew-context-brain`](https://github.com/yarik1987k/homebrew-context-brain) tap is published:
+
+```bash
+brew tap yarik1987k/context-brain
+brew install context-brain
+```
+
+> The formula template lives in [`dist/homebrew-formula/context-brain.rb`](dist/homebrew-formula/context-brain.rb).
+
+### Option 3 — From source
 
 ```bash
 # Requires Rust 1.75+ (https://rustup.rs)
-git clone <repo-url> context-brain
+git clone https://github.com/yarik1987k/contexa-brain-mcp context-brain
 cd context-brain
 cargo build --release
+# Binary at ./target/release/context-brain
 ```
-
-The binary is at `./target/release/context-brain`.
 
 > **First run:** The embedding model (~90MB, multilingual-e5-small) downloads automatically on first use. Subsequent runs are instant. If the model fails to load, the server still works with keyword-only search and displays a warning in results.
 
-### 2. Add to your editor
+## Editor setup
 
 **For Cursor** — create `.cursor/mcp.json` in your project root:
 
@@ -56,9 +85,26 @@ The binary is at `./target/release/context-brain`.
 }
 ```
 
-### 3. Restart your editor
+Restart your editor — you should see `context-brain` in your MCP settings with 8 tools enabled.
 
-You should see `context-brain` in your MCP settings with 8 tools enabled.
+## Local telemetry & privacy
+
+context-brain records each tool call in the same per-project SQLite database (`.context-brain.db`) used for the search index. You can inspect it any time:
+
+```bash
+context-brain stats --project .            # all-time
+context-brain stats --project . --days 7   # last week
+```
+
+The report shows tool-call counts, average latencies, and empty-result rates per tool — useful for tuning your prompts or spotting which retrievals routinely come back empty.
+
+**What is stored:** tool name, FNV-1a hash of the query (16 hex chars — groups equivalent queries without retaining the original text), query length in chars, result count, latency in ms, unix timestamp.
+
+**What is NOT stored:** the raw query text, file contents, symbol names, file paths, anything tied to your identity.
+
+**Outbound traffic:** none. The `telemetry` module has no HTTP client and no network code path. Verify with `tcpdump` while running a tool; you will see no outbound packets from context-brain.
+
+Delete the file at any time: `rm .context-brain.db` (the index will rebuild on next use).
 
 ## Tools
 

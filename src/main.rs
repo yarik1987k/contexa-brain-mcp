@@ -5,6 +5,7 @@ mod memory;
 mod context;
 mod db;
 mod turboquant;
+mod telemetry;
 
 use anyhow::Result;
 use clap::Parser;
@@ -93,6 +94,34 @@ enum Commands {
         #[arg(short, long, default_value_t = 2)]
         depth: u32,
     },
+    /// Show local telemetry: tool-call counts, latencies, empty-result rates.
+    /// All data is stored on-device in the per-project SQLite DB.
+    Stats {
+        /// Project path
+        #[arg(short, long, default_value = ".")]
+        project: String,
+        /// Window in days (omit for all-time)
+        #[arg(short, long)]
+        days: Option<u32>,
+    },
+    /// Memory hygiene tools (review near-duplicate / contradicting memories).
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum MemoryAction {
+    /// Surface candidate-contradiction pairs for manual review.
+    Review {
+        /// Project path
+        #[arg(short, long, default_value = ".")]
+        project: String,
+        /// Max pairs to display
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[tokio::main]
@@ -145,8 +174,19 @@ async fn main() -> Result<()> {
         }
         Commands::Remember { content, category, project } => {
             let project_path = std::fs::canonicalize(&project)?;
-            memory::store::save(&project_path, &content, &category, "")?;
-            println!("Memory saved.");
+            let outcome = memory::store::save(&project_path, &content, &category, "")?;
+            match outcome {
+                memory::store::SaveOutcome::Inserted(id) => println!("Memory saved (id {}).", id),
+                memory::store::SaveOutcome::Merged(id) => {
+                    println!("Near-duplicate found — merged into existing memory id {}.", id);
+                }
+                memory::store::SaveOutcome::Linked { new_id, peer_id } => {
+                    println!(
+                        "Cross-category duplicate of memory id {} — saved as id {} with link.",
+                        peer_id, new_id
+                    );
+                }
+            }
         }
         Commands::Recall { query, project } => {
             let project_path = std::fs::canonicalize(&project)?;
@@ -174,6 +214,19 @@ async fn main() -> Result<()> {
             let tree = tools::list_files::build_file_tree(&base, depth)?;
             print!("{}", tree);
         }
+        Commands::Stats { project, days } => {
+            let project_path = std::fs::canonicalize(&project)?;
+            let report = tools::stats::render(&project_path, days)?;
+            print!("{}", report);
+        }
+        Commands::Memory { action } => match action {
+            MemoryAction::Review { project, limit } => {
+                let project_path = std::fs::canonicalize(&project)?;
+                let pairs = memory::hygiene::find_contradictions(&project_path, limit)?;
+                let report = memory::hygiene::render_review(&pairs);
+                print!("{}", report);
+            }
+        },
     }
 
     Ok(())
