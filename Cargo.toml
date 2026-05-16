@@ -2,7 +2,7 @@
 name = "context-brain"
 version = "0.1.0"
 edition = "2021"
-description = "Intelligent MCP context manager — pay less, get more from AI coding assistants"
+description = "Local-first MCP server for AI coding agents. AST extraction, semantic search, cross-session memory. No API calls."
 license = "MIT"
 
 [dependencies]
