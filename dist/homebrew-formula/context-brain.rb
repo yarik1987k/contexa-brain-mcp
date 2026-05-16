@@ -13,7 +13,7 @@
 # The release workflow could be extended later to auto-bump this formula on each
 # tag via a PAT-authenticated commit to the tap repo.
 class ContextBrain < Formula
-  desc "Local-first MCP server that cuts LLM token bills 60-90%"
+  desc "Local-first MCP server for AI coding agents. No API calls."
   homepage "https://github.com/yarik1987k/contexa-brain-mcp"
   version "{{VERSION}}" # e.g. "0.1.0"
   license "MIT"

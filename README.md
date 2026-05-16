@@ -34,18 +34,7 @@ curl -sSL https://raw.githubusercontent.com/yarik1987k/contexa-brain-mcp/main/in
 
 Auto-detects OS + arch, downloads the matching prebuilt binary, verifies its SHA-256, and installs to `/usr/local/bin` (or `~/.local/bin` if that's not writable).
 
-### Option 2 — Homebrew (macOS)
-
-Once the [`homebrew-context-brain`](https://github.com/yarik1987k/homebrew-context-brain) tap is published:
-
-```bash
-brew tap yarik1987k/context-brain
-brew install context-brain
-```
-
-> The formula template lives in [`dist/homebrew-formula/context-brain.rb`](dist/homebrew-formula/context-brain.rb).
-
-### Option 3 — From source
+### Option 2 — From source
 
 ```bash
 # Requires Rust 1.75+ (https://rustup.rs)
