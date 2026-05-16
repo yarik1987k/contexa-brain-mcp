@@ -145,8 +145,19 @@ async fn main() -> Result<()> {
         }
         Commands::Remember { content, category, project } => {
             let project_path = std::fs::canonicalize(&project)?;
-            memory::store::save(&project_path, &content, &category, "")?;
-            println!("Memory saved.");
+            let outcome = memory::store::save(&project_path, &content, &category, "")?;
+            match outcome {
+                memory::store::SaveOutcome::Inserted(id) => println!("Memory saved (id {}).", id),
+                memory::store::SaveOutcome::Merged(id) => {
+                    println!("Near-duplicate found — merged into existing memory id {}.", id);
+                }
+                memory::store::SaveOutcome::Linked { new_id, peer_id } => {
+                    println!(
+                        "Cross-category duplicate of memory id {} — saved as id {} with link.",
+                        peer_id, new_id
+                    );
+                }
+            }
         }
         Commands::Recall { query, project } => {
             let project_path = std::fs::canonicalize(&project)?;

@@ -58,10 +58,24 @@ pub fn open_db(project_path: &Path) -> Result<Connection> {
         -- Full-text search for symbols (used by search_codebase)
         CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(name, signature);
 
+        -- Telemetry: local-only tool-call log. Never leaves the machine.
+        -- query_hash is FNV-1a of the query (16 hex chars); raw queries are never stored.
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name TEXT NOT NULL,
+            query_hash TEXT,
+            query_length INTEGER,
+            result_count INTEGER,
+            latency_ms INTEGER,
+            ts INTEGER NOT NULL
+        );
+
         -- Indexes
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_files_path ON files(relative_path);
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls(ts);
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON tool_calls(tool_name);
         ",
     )?;
 
@@ -95,6 +109,20 @@ pub fn open_db(project_path: &Path) -> Result<Connection> {
         .is_err();
     if needs_import_count {
         conn.execute_batch("ALTER TABLE files ADD COLUMN import_count INTEGER DEFAULT 0;")?;
+    }
+
+    // Migration: hygiene columns on memories — access tracking, mutation tracking, link to dedupe peer.
+    let needs_memory_hygiene: bool = conn
+        .prepare("SELECT last_accessed_at, updated_at, linked_id FROM memories LIMIT 0")
+        .is_err();
+    if needs_memory_hygiene {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE memories ADD COLUMN last_accessed_at INTEGER;
+             ALTER TABLE memories ADD COLUMN updated_at INTEGER;
+             ALTER TABLE memories ADD COLUMN linked_id INTEGER REFERENCES memories(id);",
+        )?;
+        tx.commit()?;
     }
 
     Ok(conn)
@@ -254,26 +282,8 @@ pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Store a memory with its embedding and optional compressed embedding.
-pub fn insert_memory(
-    conn: &Connection,
-    content: &str,
-    category: &str,
-    tags: &str,
-    embedding: Option<&[f32]>,
-    embedding_compressed: Option<&[u8]>,
-) -> Result<i64> {
-    let embedding_blob = embedding_to_blob(embedding);
-
-    conn.execute(
-        "INSERT INTO memories (content, category, tags, embedding, embedding_compressed)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![content, category, tags, embedding_blob, embedding_compressed],
-    )?;
-
-    let memory_id = conn.last_insert_rowid();
-    Ok(memory_id)
-}
+// Memory insertion lives in `memory/store.rs` (which owns the dedupe/link
+// logic on top of the raw INSERT) — no separate schema helper needed.
 
 // ── TurboQuant compressed embedding serialization ───────────────────
 

@@ -38,6 +38,19 @@ pub const RELEVANCE_SIM_THRESHOLD: f32 = 0.3;
 /// Minimum score for a memory to be included in recall results.
 pub const MEMORY_MIN_SCORE: f32 = 0.15;
 
+/// Two memories with cosine similarity at or above this threshold are
+/// *candidates* for deduplication. Calibrated so paraphrases (e.g.
+/// "use JWT" vs "we use JWT for auth") clear it. Pure cosine isn't enough
+/// — templated-but-distinct memories ("Decision 1: pick option 1" vs
+/// "Decision 2: pick option 2") also clear it. So dedupe additionally
+/// requires `DEDUPE_TOKEN_OVERLAP_MIN` Jaccard overlap on tokens.
+pub const DEDUPE_THRESHOLD: f32 = 0.92;
+
+/// Minimum Jaccard token overlap required alongside cosine to call two
+/// memories duplicates. Two strings with high embedding similarity but
+/// substantially different tokens (e.g. swapped numbers/names) won't merge.
+pub const DEDUPE_TOKEN_OVERLAP_MIN: f32 = 0.7;
+
 // ── Indexing pipeline ────────────────────────────────────────────────
 
 /// Minimum symbol span (lines) to generate an embedding for.
